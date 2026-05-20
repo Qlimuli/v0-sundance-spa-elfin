@@ -1,17 +1,21 @@
-"""Async TCP client for Sundance Spa communication.
+"""Async TCP client for Sundance/Balboa Spa communication.
 
-Based on the Jacuzzi-RS485 protocol implementation:
-https://github.com/jackbrown1993/Jacuzzi-RS485
+Based on the balboa_worldwide_app Ruby implementation:
+https://github.com/ccutrer/balboa_worldwide_app
 
-Sundance Spas use a modified Balboa/Jacuzzi protocol with message type 0x16
-for status updates instead of Balboa's 0x13.
+Protocol details:
+- Message format: 7E [LENGTH] [SRC] [MSG_TYPE_1] [MSG_TYPE_2] [DATA...] [CRC] 7E
+- LENGTH is the count from LENGTH to CRC (inclusive)
+- CRC is CRC-8 with init=0x02 and XOR=0x02
+- Status message type: 0xAF 0x13
+- Toggle message type: 0xBF 0x11
 """
 from __future__ import annotations
 
 import asyncio
 import logging
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Callable
 
 _LOGGER = logging.getLogger(__name__)
@@ -20,24 +24,36 @@ _LOGGER = logging.getLogger(__name__)
 M_STARTEND = 0x7E
 DEFAULT_PORT = 8899
 
-# Message type identifiers
-# Jacuzzi uses 0x16 for status updates, Balboa uses 0x13
-MSG_TYPE_STATUS_JACUZZI = 0x16
-MSG_TYPE_STATUS_BALBOA = 0x13
+# Message type identifiers (2 bytes each)
+# Status: sent by spa to all listeners
+MSG_TYPE_STATUS = bytes([0xAF, 0x13])
+# Toggle item: sent to spa to toggle pumps/lights/etc
+MSG_TYPE_TOGGLE = bytes([0xBF, 0x11])
+# Set temperature
+MSG_TYPE_SET_TEMP = bytes([0xBF, 0x20])
+# Set time
+MSG_TYPE_SET_TIME = bytes([0xBF, 0x21])
 
-# Button codes for commands (msg type 0x17)
-C_PUMP1 = 0x04
-C_PUMP2 = 0x05
-C_PUMP3 = 0x06
-C_LIGHT1 = 0x11
-C_LIGHT2 = 0x12
-C_TEMP_UP = 0x01
-C_TEMP_DOWN = 0x02
-C_BLOWER = 0x0C
+# Toggle item codes (from balboa_worldwide_app)
+TOGGLE_PUMP1 = 0x04
+TOGGLE_PUMP2 = 0x05
+TOGGLE_PUMP3 = 0x06
+TOGGLE_PUMP4 = 0x07
+TOGGLE_PUMP5 = 0x08
+TOGGLE_PUMP6 = 0x09
+TOGGLE_BLOWER = 0x0C
+TOGGLE_MISTER = 0x0E
+TOGGLE_LIGHT1 = 0x11
+TOGGLE_LIGHT2 = 0x12
+TOGGLE_AUX1 = 0x16
+TOGGLE_AUX2 = 0x17
+TOGGLE_HOLD = 0x3C
+TOGGLE_TEMP_RANGE = 0x50
+TOGGLE_HEAT_MODE = 0x51
 
-# Temperature scale
-TSCALE_F = 0
-TSCALE_C = 1
+# Source addresses
+SRC_WIFI_MODULE = 0x0A  # WiFi module address
+SRC_BROADCAST = 0xFF    # Broadcast address
 
 
 @dataclass
@@ -47,45 +63,57 @@ class SpaState:
     # Connection state
     connected: bool = False
     
-    # Temperature
+    # Temperature (in Celsius)
     current_temp: float | None = None
     target_temp: float | None = None
-    temp_scale: int = TSCALE_C  # 0=F, 1=C
+    temp_scale_celsius: bool = False
     
     # Heating
     is_heating: bool = False
-    heat_mode: int = 0  # 0=Ready, 1=Rest, 2=Ready in Rest
+    heat_mode: str = "ready"  # ready, rest, ready_in_rest
+    temperature_range: str = "high"  # high, low
     
     # Pumps (0=off, 1=low, 2=high)
     pump1_speed: int = 0
     pump2_speed: int = 0
     pump3_speed: int = 0
-    circ_pump_on: bool = False
+    pump4_speed: int = 0
+    pump5_speed: int = 0
+    pump6_speed: int = 0
     
-    # Light
-    light_on: bool = False
-    light_brightness: int = 0
+    # Other accessories
+    circ_pump_on: bool = False
+    blower: int = 0
+    mister: bool = False
+    
+    # Lights
+    light1_on: bool = False
+    light2_on: bool = False
+    
+    # Aux
+    aux1_on: bool = False
+    aux2_on: bool = False
     
     # Time
     time_hour: int = 0
     time_minute: int = 0
+    twenty_four_hour_time: bool = False
     
-    # Date (Jacuzzi specific)
-    day_of_month: int = 0
-    current_month: int = 0
-    current_year: int = 0
+    # Filter cycles
+    filter1_running: bool = False
+    filter2_running: bool = False
     
-    # Filter
-    filter_mode: int = 0
-    
-    # Error
-    error_code: int = 0
+    # Status flags
+    priming: bool = False
+    hold: bool = False
     
     # Stats
     last_update: float = 0.0
     packets_received: int = 0
+    valid_messages: int = 0
     status_updates: int = 0
     last_raw_status: str = ""
+    crc_errors: int = 0
     
     @property
     def pump1_on(self) -> bool:
@@ -94,15 +122,16 @@ class SpaState:
     @property
     def pump2_on(self) -> bool:
         return self.pump2_speed > 0
+    
+    @property
+    def light_on(self) -> bool:
+        return self.light1_on
 
 
 class SundanceElfinClient:
     """Async TCP client for Sundance Spa via Elfin-EW11A RS485-WiFi adapter.
     
-    This client implements the Jacuzzi/Sundance variant of the Balboa protocol.
-    Key differences from standard Balboa:
-    - Status update message type is 0x16 instead of 0x13
-    - Byte positions for temperature and status flags differ
+    This client implements the Balboa protocol as documented in balboa_worldwide_app.
     """
     
     def __init__(self, host: str, port: int = DEFAULT_PORT):
@@ -116,27 +145,25 @@ class SundanceElfinClient:
         self._running = False
         self._callbacks: list[Callable[[], None]] = []
         self._lock = asyncio.Lock()
-        self._prior_status: bytes | None = None
+        self._buffer = b""
         
-        # Rate limiting for logs
-        self._last_log: dict[str, float] = {}
-        
-        # Debug mode - set to True for verbose logging
+        # Debug mode - logs all packets
         self._debug = True
+        self._log_count = 0
+        self._max_logs_per_minute = 60  # Rate limit
+        self._log_reset_time = 0.0
         
-    def _log_rate_limited(self, level: int, key: str, msg: str, *args) -> None:
-        """Log with rate limiting to prevent spam."""
-        now = time.time()
-        if key in self._last_log and now - self._last_log[key] < 10.0:
-            return
-        self._last_log[key] = now
-        _LOGGER.log(level, msg, *args)
-    
     def _debug_log(self, msg: str, *args) -> None:
-        """Always log debug messages when debug mode is enabled."""
-        if self._debug:
-            _LOGGER.warning("[SUNDANCE DEBUG] " + msg, *args)
+        """Log debug messages with rate limiting."""
+        now = time.time()
+        if now - self._log_reset_time > 60:
+            self._log_count = 0
+            self._log_reset_time = now
         
+        if self._debug and self._log_count < self._max_logs_per_minute:
+            self._log_count += 1
+            _LOGGER.warning("[SUNDANCE] " + msg, *args)
+    
     def register_callback(self, callback: Callable[[], None]) -> Callable[[], None]:
         """Register a callback for state changes."""
         self._callbacks.append(callback)
@@ -154,14 +181,35 @@ class SundanceElfinClient:
             except Exception:
                 _LOGGER.exception("Callback error")
     
+    @staticmethod
+    def crc8(data: bytes) -> int:
+        """Calculate CRC-8 checksum per Balboa spec.
+        
+        From balboa_worldwide_app/lib/bwa/crc.rb:
+        - Uses CRC-8 polynomial 0x07
+        - INIT_CRC = 0x02
+        - XOR_MASK = 0x02
+        """
+        crc = 0x02  # Initial value
+        for byte in data:
+            crc ^= byte
+            for _ in range(8):
+                if crc & 0x80:
+                    crc = ((crc << 1) ^ 0x07) & 0xFF
+                else:
+                    crc = (crc << 1) & 0xFF
+        return crc ^ 0x02  # XOR with mask
+    
     async def connect(self) -> bool:
         """Connect to the spa."""
         try:
+            self._debug_log("Connecting to %s:%s...", self.host, self.port)
             self._reader, self._writer = await asyncio.wait_for(
                 asyncio.open_connection(self.host, self.port),
                 timeout=10.0
             )
             self.state.connected = True
+            self._buffer = b""
             _LOGGER.info("Connected to Sundance Spa at %s:%s", self.host, self.port)
             self._notify()
             return True
@@ -201,453 +249,391 @@ class SundanceElfinClient:
         """Stop the client."""
         await self.disconnect()
     
-    def balboa_calc_cs(self, data: bytes, length: int) -> int:
-        """Calculate Balboa CRC-8 checksum.
-        
-        CRC-8 with:
-        - Poly = 0x07
-        - Init = 0x02
-        - XorOut = 0x02
-        """
-        crc = 0xB5
-        for i in range(length):
-            for j in range(8):
-                bit = crc & 0x80
-                crc = ((crc << 1) & 0xFF) | ((data[i] >> (7 - j)) & 0x01)
-                if bit:
-                    crc = crc ^ 0x07
-            crc &= 0xFF
-        for j in range(8):
-            bit = crc & 0x80
-            crc = (crc << 1) & 0xFF
-            if bit:
-                crc ^= 0x07
-        return crc ^ 0x02
-    
     async def _listen_loop(self) -> None:
         """Main receive loop."""
+        reconnect_delay = 5
+        
         while self._running:
             try:
                 if not self._reader or not self.state.connected:
-                    await asyncio.sleep(30)
+                    self._debug_log("Not connected, waiting %ds before reconnect...", reconnect_delay)
+                    await asyncio.sleep(reconnect_delay)
+                    reconnect_delay = min(reconnect_delay * 2, 60)
                     if self._running:
-                        await self.connect()
+                        if await self.connect():
+                            reconnect_delay = 5
                     continue
                 
-                msg = await self._read_one_message()
-                if msg:
-                    self._process_message(msg)
+                # Read available data
+                try:
+                    chunk = await asyncio.wait_for(
+                        self._reader.read(1024),
+                        timeout=30.0
+                    )
+                except asyncio.TimeoutError:
+                    self._debug_log("Read timeout - connection may be idle")
+                    continue
+                
+                if not chunk:
+                    self._debug_log("Connection closed by remote")
+                    self.state.connected = False
+                    self._notify()
+                    continue
+                
+                self._buffer += chunk
+                self.state.packets_received += 1
+                
+                # Process all complete messages in buffer
+                self._process_buffer()
                     
             except asyncio.CancelledError:
                 break
             except Exception as e:
-                self._log_rate_limited(logging.ERROR, "listen_err", "Listen error: %s", e)
+                _LOGGER.error("Listen error: %s", e)
                 self.state.connected = False
                 self._notify()
-                await asyncio.sleep(30)
+                await asyncio.sleep(reconnect_delay)
+                reconnect_delay = min(reconnect_delay * 2, 60)
                 if self._running:
                     await self.connect()
     
-    async def _read_one_message(self) -> bytes | None:
-        """Read one complete message from the spa.
+    def _process_buffer(self) -> None:
+        """Process complete messages from the buffer.
         
-        Message format:
-        [0x7E] [LENGTH] [DATA...] [CHECKSUM] [0x7E]
+        Message format (from balboa_worldwide_app):
+        [0x7E] [LENGTH] [SRC] [TYPE1] [TYPE2] [DATA...] [CRC] [0x7E]
         
-        LENGTH includes everything from LENGTH to CHECKSUM (inclusive).
+        LENGTH = number of bytes from LENGTH to CRC (inclusive)
+        So total message length = LENGTH + 2 (for start and end bytes)
         """
-        if not self._reader:
-            return None
+        while len(self._buffer) >= 5:  # Minimum message size
+            # Find start byte
+            start_idx = self._buffer.find(bytes([M_STARTEND]))
+            if start_idx == -1:
+                self._buffer = b""
+                return
+            
+            # Discard bytes before start
+            if start_idx > 0:
+                self._debug_log("Discarding %d bytes before start: %s", 
+                              start_idx, self._buffer[:start_idx].hex())
+                self._buffer = self._buffer[start_idx:]
+            
+            if len(self._buffer) < 2:
+                return
+            
+            # Get length byte
+            length = self._buffer[1]
+            
+            # Sanity check length (valid range is 5-126 per balboa_worldwide_app)
+            if length < 5 or length >= M_STARTEND:
+                self._debug_log("Invalid length %d, skipping byte", length)
+                self._buffer = self._buffer[1:]
+                continue
+            
+            # Check if we have the full message
+            total_len = length + 2  # +2 for start byte and end byte
+            if len(self._buffer) < total_len:
+                return  # Wait for more data
+            
+            # Check end byte
+            if self._buffer[total_len - 1] != M_STARTEND:
+                self._debug_log("Missing end byte at position %d, got 0x%02x", 
+                              total_len - 1, self._buffer[total_len - 1])
+                self._buffer = self._buffer[1:]
+                continue
+            
+            # Extract message
+            message = self._buffer[:total_len]
+            
+            # Verify CRC (calculated over bytes from LENGTH to before CRC)
+            crc_data = message[1:total_len - 2]  # LENGTH through DATA
+            calculated_crc = self.crc8(crc_data)
+            received_crc = message[total_len - 2]
+            
+            if calculated_crc != received_crc:
+                self.state.crc_errors += 1
+                self._debug_log("CRC ERROR #%d: calc=0x%02x recv=0x%02x msg=%s", 
+                              self.state.crc_errors, calculated_crc, received_crc, message.hex())
+                self._buffer = self._buffer[1:]
+                continue
+            
+            # Valid message!
+            self.state.valid_messages += 1
+            self._debug_log("VALID MSG #%d: %s", self.state.valid_messages, message.hex())
+            
+            # Remove from buffer and process
+            self._buffer = self._buffer[total_len:]
+            self._process_message(message)
+    
+    def _process_message(self, msg: bytes) -> None:
+        """Process a validated message.
         
-        try:
-            # Read header (start byte + length)
-            header = await asyncio.wait_for(
-                self._reader.readexactly(2),
-                timeout=60.0
-            )
-        except asyncio.TimeoutError:
-            return None
-        except Exception as e:
-            self._log_rate_limited(logging.ERROR, "read_header", "Read header error: %s", e)
-            self.state.connected = False
-            self._notify()
-            return None
+        Format: 7E [LEN] [SRC] [TYPE1] [TYPE2] [DATA...] [CRC] 7E
+        """
+        if len(msg) < 7:  # Minimum: 7E LEN SRC T1 T2 CRC 7E
+            return
         
-        # Check for start byte
-        if header[0] == M_STARTEND:
-            rlen = header[1]
-        elif header[1] == M_STARTEND:
-            # Misaligned, try to recover
-            try:
-                rlen_bytes = await self._reader.readexactly(1)
-                rlen = rlen_bytes[0]
-            except Exception:
-                return None
+        src = msg[2]
+        msg_type = msg[3:5]  # Two-byte message type
+        data = msg[5:-2]     # Data between type and CRC
+        
+        self._debug_log("MSG: src=0x%02x type=%s datalen=%d", src, msg_type.hex(), len(data))
+        
+        # Status message (0xAF 0x13)
+        if msg_type == MSG_TYPE_STATUS:
+            self._parse_status(data)
         else:
-            return None
-        
-        # Sanity check length
-        if rlen < 3 or rlen > 128:
-            return None
-        
-        # Read the rest of the message
-        try:
-            data = await asyncio.wait_for(
-                self._reader.readexactly(rlen),
-                timeout=5.0
-            )
-        except Exception as e:
-            self._log_rate_limited(logging.ERROR, "read_data", "Read data error: %s", e)
-            return None
-        
-        full_data = header + data
-        self.state.packets_received += 1
-        
-        # DEBUG: Log every raw packet
-        self._debug_log("RAW PACKET #%d: %s", self.state.packets_received, full_data.hex())
-        
-        # Verify checksum (checksum is second-to-last byte, last byte is 0x7E)
-        if full_data[-1] != M_STARTEND:
-            self._debug_log("PACKET MISSING END BYTE: got 0x%02x", full_data[-1])
-            return None
-        
-        # Calculate and verify CRC
-        crc = self.balboa_calc_cs(full_data[1:], rlen - 1)
-        if crc != full_data[-2]:
-            self._debug_log("BAD CRC: calculated=0x%02x, received=0x%02x", crc, full_data[-2])
-            return None
-        
-        self._debug_log("VALID PACKET: len=%d, data=%s", rlen, full_data.hex())
-        
-        return full_data
+            self._debug_log("Unknown msg type: %s (full: %s)", msg_type.hex(), msg.hex())
     
-    def _process_message(self, data: bytes) -> None:
-        """Process a received message."""
-        if len(data) < 5:
-            self._debug_log("MESSAGE TOO SHORT: len=%d", len(data))
-            return
+    def _parse_status(self, data: bytes) -> None:
+        """Parse status message data.
         
-        # Message format: 7E [LEN] [ADDR1] [ADDR2] [MSG_TYPE] [DATA...] [CRC] 7E
-        # Addresses: 0xFF 0xAF = broadcast from panel/controller
-        addr1 = data[2]
-        addr2 = data[3]
-        msg_type = data[4]
-        
-        self._debug_log("PROCESSING: addr1=0x%02x addr2=0x%02x msg_type=0x%02x len=%d", 
-                       addr1, addr2, msg_type, len(data))
-        
-        # Status update (Jacuzzi uses 0x16, Balboa uses 0x13)
-        if addr1 == 0xFF and addr2 == 0xAF:
-            if msg_type == MSG_TYPE_STATUS_JACUZZI:
-                self._debug_log("JACUZZI STATUS UPDATE (0x16) detected")
-                self._parse_jacuzzi_status(data)
-            elif msg_type == MSG_TYPE_STATUS_BALBOA:
-                self._debug_log("BALBOA STATUS UPDATE (0x13) detected")
-                self._parse_balboa_status(data)
-            else:
-                self._debug_log("UNKNOWN BROADCAST msg_type=0x%02x (not 0x13 or 0x16)", msg_type)
-        else:
-            self._debug_log("NON-BROADCAST MESSAGE: addr1=0x%02x addr2=0x%02x (expected 0xFF 0xAF)", 
-                           addr1, addr2)
-    
-    def _parse_jacuzzi_status(self, data: bytes) -> None:
-        """Parse Jacuzzi status update (msg type 0x16).
-        
-        Byte positions based on Jacuzzi-RS485 project:
-        data[5] = time hour
-        data[6] = time minute
-        data[7] = day of week (bits 7-5) + day of month (bits 4-0)
-        data[8] = current month
-        data[9] = current year (since 2000)
-        data[10] = filter2 mode (bits 7-6), heat mode (bits 5-4), spa state (bits 3-0)
-        data[11] = error code
-        data[12] = current temp (raw)
-        data[13] = don't care
-        data[14] = target/set temp (raw)
-        data[15] = pump states: pump3(7-6), pump2(5-4), pump1(3-2), ?(1-0)
-        data[16] = circ pump / blower state
-        data[17] = light state
+        Based on balboa_worldwide_app/lib/bwa/messages/status.rb:
+        data[0] = flags (hold)
+        data[1] = priming flag (0x01 = priming)
+        data[2] = current temperature
+        data[3] = hour
+        data[4] = minute
+        data[5] = heating mode flags
+        data[6] = notification
+        data[7-8] = ?
+        data[9] = temp scale (bit 0), 24h time (bit 1), filter cycles (bits 2-3)
+        data[10] = heating (bits 4-5), temp range (bit 2)
+        data[11] = pumps 1-4 state
+        data[12] = pumps 5-6 state
+        data[13] = circ pump (bit 1), blower (bits 2-3)
+        data[14] = lights 1-2
+        data[15] = mister (bit 0), aux1 (bit 3), aux2 (bit 4)
+        ...
+        data[20] = target temperature
         """
-        if len(data) < 20:
-            self._debug_log("JACUZZI STATUS TOO SHORT: len=%d (need 20)", len(data))
+        if len(data) < 21:
+            self._debug_log("Status too short: %d bytes (need 21+)", len(data))
             return
         
-        # Log all raw byte values for analysis
-        self._debug_log("JACUZZI RAW BYTES:")
-        for i in range(min(len(data), 25)):
-            self._debug_log("  data[%d] = 0x%02x (%d)", i, data[i], data[i])
+        # Log raw bytes for debugging
+        self._debug_log("STATUS RAW (%d bytes):", len(data))
+        for i, b in enumerate(data[:25]):
+            self._debug_log("  [%2d] = 0x%02x (%3d) %s", i, b, b, bin(b))
         
-        # Check if status changed (skip redundant updates)
-        status_hex = data.hex()
-        if self._prior_status and status_hex == self._prior_status.hex():
-            self._debug_log("JACUZZI STATUS UNCHANGED - skipping")
-            return
-        self._prior_status = data
-        
-        # Store raw for debugging
-        self.state.last_raw_status = status_hex
+        # Store raw hex
+        self.state.last_raw_status = data.hex()
         
         try:
-            # Time
-            self.state.time_hour = data[5]
-            self.state.time_minute = data[6]
-            self._debug_log("TIME: %02d:%02d", data[5], data[6])
+            # Hold mode
+            self.state.hold = (data[0] & 0x05) != 0
             
-            # Date
-            self.state.day_of_month = data[7] & 0x1F
-            self.state.current_month = data[8]
-            self.state.current_year = data[9] + 2000
-            self._debug_log("DATE: %d/%d/%d", data[8], data[7] & 0x1F, data[9] + 2000)
-            
-            # Heat mode and state
-            self.state.heat_mode = (data[10] >> 4) & 0x03
-            self.state.is_heating = self.state.heat_mode > 0
-            self._debug_log("HEAT: mode=%d heating=%s (raw byte[10]=0x%02x)", 
-                           self.state.heat_mode, self.state.is_heating, data[10])
-            
-            # Error code
-            self.state.error_code = data[11]
-            if data[11] != 0:
-                self._debug_log("ERROR CODE: %d", data[11])
-            
-            # Current temperature (raw value)
-            raw_temp = data[12]
-            self._debug_log("CURRENT TEMP RAW: data[12]=0x%02x (%d)", raw_temp, raw_temp)
-            
-            if raw_temp != 0xFF:  # 0xFF = unknown/unavailable
-                # Temperature is stored as Fahrenheit / 2 when in Celsius mode
-                # Or direct Fahrenheit when in F mode
-                # Sundance typically uses Celsius, so value is F*2
-                # Convert: raw/2 = F, then (F-32)*5/9 = C
-                temp_f = raw_temp / 2.0 if self.state.temp_scale == TSCALE_C else raw_temp
-                temp_c = round((temp_f - 32) * 5 / 9, 1)
-                self._debug_log("CURRENT TEMP CALC: raw=%d, temp_f=%.1f, temp_c=%.1f", 
-                               raw_temp, temp_f, temp_c)
-                self.state.current_temp = temp_c
-            else:
-                self._debug_log("CURRENT TEMP: 0xFF = unavailable")
-                self.state.current_temp = None
-            
-            # Target temperature
-            raw_settemp = data[14]
-            self._debug_log("TARGET TEMP RAW: data[14]=0x%02x (%d)", raw_settemp, raw_settemp)
-            
-            if raw_settemp != 0xFF:
-                temp_f = raw_settemp / 2.0 if self.state.temp_scale == TSCALE_C else raw_settemp
-                temp_c = round((temp_f - 32) * 5 / 9, 1)
-                self._debug_log("TARGET TEMP CALC: raw=%d, temp_f=%.1f, temp_c=%.1f", 
-                               raw_settemp, temp_f, temp_c)
-                self.state.target_temp = temp_c
-            
-            # Pump states from byte 15
-            # Bits 7-6 = Pump 3
-            # Bits 5-4 = Pump 2
-            # Bits 3-2 = Pump 1
-            pump_byte = data[15]
-            self._debug_log("PUMP BYTE: data[15]=0x%02x (%s)", pump_byte, bin(pump_byte))
-            
-            self.state.pump3_speed = (pump_byte >> 6) & 0x03
-            self.state.pump2_speed = (pump_byte >> 4) & 0x03
-            self.state.pump1_speed = (pump_byte >> 2) & 0x03
-            self._debug_log("PUMPS: pump1=%d pump2=%d pump3=%d", 
-                           self.state.pump1_speed, self.state.pump2_speed, self.state.pump3_speed)
-            
-            # Circ pump from byte 16
-            if len(data) > 16:
-                self.state.circ_pump_on = (data[16] & 0x02) != 0
-                self._debug_log("CIRC PUMP: data[16]=0x%02x, on=%s", data[16], self.state.circ_pump_on)
-            
-            # Light from byte 17
-            if len(data) > 17:
-                self.state.light_on = (data[17] & 0x03) != 0
-                self._debug_log("LIGHT: data[17]=0x%02x, on=%s", data[17], self.state.light_on)
-            
-            self.state.status_updates += 1
-            self.state.last_update = time.time()
-            
-            self._debug_log("=== STATUS UPDATE #%d COMPLETE: temp=%.1f/%.1f C ===",
-                self.state.status_updates,
-                self.state.current_temp or 0,
-                self.state.target_temp or 0
-            )
-            
-            self._notify()
-            
-        except Exception as e:
-            self._debug_log("PARSE ERROR: %s", e)
-            import traceback
-            self._debug_log("TRACEBACK: %s", traceback.format_exc())
-    
-    def _parse_balboa_status(self, data: bytes) -> None:
-        """Parse Balboa status update (msg type 0x13).
-        
-        Byte positions for standard Balboa:
-        data[7] = current temp
-        data[8] = time hour
-        data[9] = time minute
-        data[10] = heat mode
-        data[14] = temp scale (bit 0), time scale (bit 1)
-        data[15] = heat state (bits 5-4), temp range (bit 2)
-        data[16] = pump 1-4 states
-        data[19] = light states
-        data[25] = target temp
-        """
-        if len(data) < 28:
-            return
-        
-        status_hex = data.hex()
-        if self._prior_status and status_hex == self._prior_status.hex():
-            return
-        self._prior_status = data
-        
-        self.state.last_raw_status = status_hex
-        
-        try:
-            # Temperature scale from flags
-            self.state.temp_scale = TSCALE_C if (data[14] & 0x01) else TSCALE_F
-            
-            # Time
-            self.state.time_hour = data[8]
-            self.state.time_minute = data[9]
+            # Priming
+            self.state.priming = data[1] == 0x01
             
             # Current temperature
-            raw_temp = data[7]
+            raw_temp = data[2]
+            self._debug_log("RAW TEMP: data[2]=0x%02x (%d)", raw_temp, raw_temp)
+            
+            # Temperature scale from data[9]
+            self.state.temp_scale_celsius = (data[9] & 0x01) == 0x01
+            self.state.twenty_four_hour_time = (data[9] & 0x02) == 0x02
+            self.state.filter1_running = (data[9] & 0x04) != 0
+            self.state.filter2_running = (data[9] & 0x08) != 0
+            
+            self._debug_log("SCALE: celsius=%s, 24h=%s, filter1=%s, filter2=%s",
+                          self.state.temp_scale_celsius, self.state.twenty_four_hour_time,
+                          self.state.filter1_running, self.state.filter2_running)
+            
             if raw_temp != 0xFF:
-                if self.state.temp_scale == TSCALE_C:
+                if self.state.temp_scale_celsius:
+                    # In Celsius mode, temp is stored as C * 2
                     self.state.current_temp = raw_temp / 2.0
                 else:
+                    # In Fahrenheit mode, convert to Celsius
                     self.state.current_temp = round((raw_temp - 32) * 5 / 9, 1)
-            
-            # Target temperature
-            raw_settemp = data[25]
-            if self.state.temp_scale == TSCALE_C:
-                self.state.target_temp = raw_settemp / 2.0
+                self._debug_log("CURRENT TEMP: %.1f C", self.state.current_temp)
             else:
-                self.state.target_temp = round((raw_settemp - 32) * 5 / 9, 1)
+                self.state.current_temp = None
+                self._debug_log("CURRENT TEMP: unavailable (0xFF)")
             
-            # Heat mode and state
-            self.state.heat_mode = data[10] & 0x03
-            self.state.is_heating = ((data[15] >> 4) & 0x03) > 0
+            # Time
+            self.state.time_hour = data[3]
+            self.state.time_minute = data[4]
+            self._debug_log("TIME: %02d:%02d", data[3], data[4])
             
-            # Pump states from byte 16
-            pump_byte = data[16]
-            self.state.pump1_speed = (pump_byte >> 0) & 0x03
-            self.state.pump2_speed = (pump_byte >> 2) & 0x03
+            # Heating mode from data[5]
+            heat_mode_val = data[5] & 0x03
+            self.state.heat_mode = {0: "ready", 1: "rest", 2: "ready_in_rest"}.get(heat_mode_val, "ready")
+            self._debug_log("HEAT MODE: %s (raw=0x%02x)", self.state.heat_mode, data[5])
             
-            # Light from byte 19
-            self.state.light_on = ((data[19] >> 0) & 0x03) > 0
+            # Heating state and temp range from data[10]
+            self.state.is_heating = (data[10] & 0x30) != 0
+            self.state.temperature_range = "high" if (data[10] & 0x04) else "low"
+            self._debug_log("HEATING: %s, RANGE: %s (raw=0x%02x)", 
+                          self.state.is_heating, self.state.temperature_range, data[10])
+            
+            # Pump states from data[11] - 2 bits each for pumps 1-4
+            pumps = data[11]
+            self.state.pump1_speed = pumps & 0x03
+            self.state.pump2_speed = (pumps >> 2) & 0x03
+            self.state.pump3_speed = (pumps >> 4) & 0x03
+            self.state.pump4_speed = (pumps >> 6) & 0x03
+            self._debug_log("PUMPS 1-4: %d %d %d %d (raw=0x%02x)", 
+                          self.state.pump1_speed, self.state.pump2_speed,
+                          self.state.pump3_speed, self.state.pump4_speed, pumps)
+            
+            # Pumps 5-6 from data[12]
+            if len(data) > 12:
+                pumps56 = data[12]
+                self.state.pump5_speed = pumps56 & 0x03
+                self.state.pump6_speed = (pumps56 >> 2) & 0x03
+            
+            # Circ pump and blower from data[13]
+            if len(data) > 13:
+                self.state.circ_pump_on = (data[13] & 0x02) == 0x02
+                self.state.blower = (data[13] >> 2) & 0x03
+                self._debug_log("CIRC: %s, BLOWER: %d (raw=0x%02x)", 
+                              self.state.circ_pump_on, self.state.blower, data[13])
+            
+            # Lights from data[14]
+            if len(data) > 14:
+                self.state.light1_on = (data[14] & 0x03) != 0
+                self.state.light2_on = ((data[14] >> 2) & 0x03) != 0
+                self._debug_log("LIGHTS: L1=%s L2=%s (raw=0x%02x)", 
+                              self.state.light1_on, self.state.light2_on, data[14])
+            
+            # Mister and aux from data[15]
+            if len(data) > 15:
+                self.state.mister = (data[15] & 0x01) == 0x01
+                self.state.aux1_on = (data[15] & 0x08) != 0
+                self.state.aux2_on = (data[15] & 0x10) != 0
+            
+            # Target temperature from data[20]
+            if len(data) > 20:
+                raw_target = data[20]
+                self._debug_log("RAW TARGET: data[20]=0x%02x (%d)", raw_target, raw_target)
+                if self.state.temp_scale_celsius:
+                    self.state.target_temp = raw_target / 2.0
+                else:
+                    self.state.target_temp = round((raw_target - 32) * 5 / 9, 1)
+                self._debug_log("TARGET TEMP: %.1f C", self.state.target_temp)
             
             self.state.status_updates += 1
             self.state.last_update = time.time()
             
+            self._debug_log("=== STATUS #%d COMPLETE: %.1f/%.1f C, pumps=%d/%d, light=%s ===",
+                          self.state.status_updates,
+                          self.state.current_temp or 0,
+                          self.state.target_temp or 0,
+                          self.state.pump1_speed,
+                          self.state.pump2_speed,
+                          self.state.light1_on)
+            
             self._notify()
             
         except Exception as e:
-            self._log_rate_limited(logging.WARNING, "parse_balboa_err",
-                "Balboa parse error: %s", e)
+            _LOGGER.exception("Status parse error: %s", e)
     
-    async def send_message(self, *msg_bytes: int) -> bool:
+    def _build_message(self, msg_type: bytes, data: bytes = b"") -> bytes:
+        """Build a complete message to send to the spa.
+        
+        Format: 7E [LEN] [SRC] [TYPE1] [TYPE2] [DATA...] [CRC] 7E
+        """
+        # Length = LEN + SRC + TYPE1 + TYPE2 + DATA + CRC = 4 + len(data) + 1 = 5 + len(data)
+        length = 5 + len(data)
+        
+        # Build message body (LENGTH through DATA, for CRC calculation)
+        body = bytes([length, SRC_WIFI_MODULE]) + msg_type + data
+        
+        # Calculate CRC over body
+        crc = self.crc8(body)
+        
+        # Complete message
+        message = bytes([M_STARTEND]) + body + bytes([crc, M_STARTEND])
+        
+        return message
+    
+    async def send_message(self, msg_type: bytes, data: bytes = b"") -> bool:
         """Send a message to the spa."""
         async with self._lock:
             if not self._writer or not self.state.connected:
-                self._debug_log("SEND FAILED: not connected (writer=%s, connected=%s)", 
-                               self._writer is not None, self.state.connected)
+                self._debug_log("SEND FAILED: not connected")
                 return False
             
-            # Build message: 7E [LEN] [DATA...] [CRC] 7E
-            message_length = len(msg_bytes) + 2  # +2 for CRC and end byte
-            msg = bytearray(message_length + 2)
-            msg[0] = M_STARTEND
-            msg[1] = message_length
-            msg[2:2 + len(msg_bytes)] = msg_bytes
-            msg[-2] = self.balboa_calc_cs(msg[1:message_length], message_length - 1)
-            msg[-1] = M_STARTEND
-            
-            self._debug_log("SENDING MESSAGE: %s (bytes: %s)", msg.hex(), list(msg))
+            message = self._build_message(msg_type, data)
+            self._debug_log("SENDING: %s", message.hex())
             
             try:
-                self._writer.write(msg)
+                self._writer.write(message)
                 await self._writer.drain()
-                self._debug_log("SEND SUCCESS")
+                self._debug_log("SEND OK")
                 return True
             except Exception as e:
-                self._debug_log("SEND EXCEPTION: %s", e)
+                _LOGGER.error("Send failed: %s", e)
                 self.state.connected = False
                 self._notify()
                 return False
     
-    async def send_button(self, button: int) -> bool:
-        """Send a button press command.
+    async def toggle_item(self, item: int) -> bool:
+        """Toggle a spa item (pump, light, etc).
         
-        Command format for Jacuzzi:
-        [CHANNEL] 0xBF 0x17 [BUTTON]
-        
-        For WiFi module, channel is typically 0x0A.
+        Message format: 7E [LEN] [SRC] BF 11 [ITEM] 00 [CRC] 7E
         """
-        self._debug_log("BUTTON PRESS: button=0x%02x (%s)", button, 
-                       {C_PUMP1: 'PUMP1', C_PUMP2: 'PUMP2', C_LIGHT1: 'LIGHT', 
-                        C_TEMP_UP: 'TEMP_UP', C_TEMP_DOWN: 'TEMP_DOWN'}.get(button, 'UNKNOWN'))
-        # 0x0A = WiFi module channel, 0xBF = always, 0x17 = button press msg type
-        return await self.send_message(0x0A, 0xBF, 0x17, button)
+        self._debug_log("TOGGLE: item=0x%02x", item)
+        return await self.send_message(MSG_TYPE_TOGGLE, bytes([item, 0x00]))
     
     async def toggle_pump1(self) -> bool:
         """Toggle pump 1."""
-        self._debug_log("TOGGLE PUMP1 called (current speed=%d)", self.state.pump1_speed)
-        result = await self.send_button(C_PUMP1)
+        self._debug_log("Toggle pump1 (current speed=%d)", self.state.pump1_speed)
+        result = await self.toggle_item(TOGGLE_PUMP1)
         if result:
-            # Optimistic update
+            # Optimistic update: cycle through 0 -> 1 -> 2 -> 0
             self.state.pump1_speed = (self.state.pump1_speed + 1) % 3
-            self._debug_log("PUMP1 optimistic update: new speed=%d", self.state.pump1_speed)
             self._notify()
         return result
     
     async def toggle_pump2(self) -> bool:
         """Toggle pump 2."""
-        self._debug_log("TOGGLE PUMP2 called (current speed=%d)", self.state.pump2_speed)
-        result = await self.send_button(C_PUMP2)
+        self._debug_log("Toggle pump2 (current speed=%d)", self.state.pump2_speed)
+        result = await self.toggle_item(TOGGLE_PUMP2)
         if result:
             self.state.pump2_speed = (self.state.pump2_speed + 1) % 3
-            self._debug_log("PUMP2 optimistic update: new speed=%d", self.state.pump2_speed)
             self._notify()
         return result
     
     async def toggle_light(self) -> bool:
-        """Toggle light."""
-        self._debug_log("TOGGLE LIGHT called (current state=%s)", self.state.light_on)
-        result = await self.send_button(C_LIGHT1)
+        """Toggle light 1."""
+        self._debug_log("Toggle light1 (current=%s)", self.state.light1_on)
+        result = await self.toggle_item(TOGGLE_LIGHT1)
         if result:
-            self.state.light_on = not self.state.light_on
-            self._debug_log("LIGHT optimistic update: new state=%s", self.state.light_on)
+            self.state.light1_on = not self.state.light1_on
+            self._notify()
+        return result
+    
+    async def set_temperature(self, temp_c: float) -> bool:
+        """Set the target temperature in Celsius.
+        
+        Message format: 7E [LEN] [SRC] BF 20 [TEMP] [CRC] 7E
+        """
+        if self.state.temp_scale_celsius:
+            raw_temp = int(temp_c * 2)
+        else:
+            # Convert to Fahrenheit
+            temp_f = (temp_c * 9 / 5) + 32
+            raw_temp = int(temp_f)
+        
+        self._debug_log("Set temp: %.1f C -> raw=%d", temp_c, raw_temp)
+        result = await self.send_message(MSG_TYPE_SET_TEMP, bytes([raw_temp]))
+        if result:
+            self.state.target_temp = temp_c
             self._notify()
         return result
     
     async def increase_temp(self) -> bool:
-        """Increase target temperature."""
-        self._debug_log("INCREASE TEMP called (current target=%.1f)", self.state.target_temp or 0)
-        return await self.send_button(C_TEMP_UP)
+        """Increase target temperature by 0.5C."""
+        if self.state.target_temp is not None:
+            return await self.set_temperature(self.state.target_temp + 0.5)
+        return False
     
     async def decrease_temp(self) -> bool:
-        """Decrease target temperature."""
-        self._debug_log("DECREASE TEMP called (current target=%.1f)", self.state.target_temp or 0)
-        return await self.send_button(C_TEMP_DOWN)
-    
-    async def set_target_temperature(self, temp_c: float) -> bool:
-        """Set target temperature by sending temp up/down buttons."""
-        if self.state.target_temp is None:
-            _LOGGER.warning("Cannot set temp: current target unknown")
-            return False
-        
-        diff = temp_c - self.state.target_temp
-        steps = int(abs(diff) / 0.5)  # 0.5°C per button press
-        
-        _LOGGER.info("Setting temp from %.1f to %.1f°C (%d steps)",
-            self.state.target_temp, temp_c, steps)
-        
-        for _ in range(min(steps, 20)):
-            if diff > 0:
-                await self.increase_temp()
-            else:
-                await self.decrease_temp()
-            await asyncio.sleep(0.5)
-        
-        return True
+        """Decrease target temperature by 0.5C."""
+        if self.state.target_temp is not None:
+            return await self.set_temperature(self.state.target_temp - 0.5)
+        return False
