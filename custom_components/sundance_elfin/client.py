@@ -121,6 +121,9 @@ class SundanceElfinClient:
         # Rate limiting for logs
         self._last_log: dict[str, float] = {}
         
+        # Debug mode - set to True for verbose logging
+        self._debug = True
+        
     def _log_rate_limited(self, level: int, key: str, msg: str, *args) -> None:
         """Log with rate limiting to prevent spam."""
         now = time.time()
@@ -128,6 +131,11 @@ class SundanceElfinClient:
             return
         self._last_log[key] = now
         _LOGGER.log(level, msg, *args)
+    
+    def _debug_log(self, msg: str, *args) -> None:
+        """Always log debug messages when debug mode is enabled."""
+        if self._debug:
+            _LOGGER.warning("[SUNDANCE DEBUG] " + msg, *args)
         
     def register_callback(self, callback: Callable[[], None]) -> Callable[[], None]:
         """Register a callback for state changes."""
@@ -295,23 +303,28 @@ class SundanceElfinClient:
         full_data = header + data
         self.state.packets_received += 1
         
+        # DEBUG: Log every raw packet
+        self._debug_log("RAW PACKET #%d: %s", self.state.packets_received, full_data.hex())
+        
         # Verify checksum (checksum is second-to-last byte, last byte is 0x7E)
         if full_data[-1] != M_STARTEND:
-            self._log_rate_limited(logging.DEBUG, "no_end", "Message missing end byte")
+            self._debug_log("PACKET MISSING END BYTE: got 0x%02x", full_data[-1])
             return None
         
         # Calculate and verify CRC
         crc = self.balboa_calc_cs(full_data[1:], rlen - 1)
         if crc != full_data[-2]:
-            self._log_rate_limited(logging.DEBUG, "bad_crc", 
-                "Bad CRC: calc=%02x, got=%02x", crc, full_data[-2])
+            self._debug_log("BAD CRC: calculated=0x%02x, received=0x%02x", crc, full_data[-2])
             return None
+        
+        self._debug_log("VALID PACKET: len=%d, data=%s", rlen, full_data.hex())
         
         return full_data
     
     def _process_message(self, data: bytes) -> None:
         """Process a received message."""
         if len(data) < 5:
+            self._debug_log("MESSAGE TOO SHORT: len=%d", len(data))
             return
         
         # Message format: 7E [LEN] [ADDR1] [ADDR2] [MSG_TYPE] [DATA...] [CRC] 7E
@@ -320,15 +333,22 @@ class SundanceElfinClient:
         addr2 = data[3]
         msg_type = data[4]
         
+        self._debug_log("PROCESSING: addr1=0x%02x addr2=0x%02x msg_type=0x%02x len=%d", 
+                       addr1, addr2, msg_type, len(data))
+        
         # Status update (Jacuzzi uses 0x16, Balboa uses 0x13)
         if addr1 == 0xFF and addr2 == 0xAF:
             if msg_type == MSG_TYPE_STATUS_JACUZZI:
+                self._debug_log("JACUZZI STATUS UPDATE (0x16) detected")
                 self._parse_jacuzzi_status(data)
             elif msg_type == MSG_TYPE_STATUS_BALBOA:
+                self._debug_log("BALBOA STATUS UPDATE (0x13) detected")
                 self._parse_balboa_status(data)
             else:
-                self._log_rate_limited(logging.DEBUG, f"unk_msg_{msg_type}",
-                    "Unknown broadcast msg type 0x%02x: %s", msg_type, data.hex()[:60])
+                self._debug_log("UNKNOWN BROADCAST msg_type=0x%02x (not 0x13 or 0x16)", msg_type)
+        else:
+            self._debug_log("NON-BROADCAST MESSAGE: addr1=0x%02x addr2=0x%02x (expected 0xFF 0xAF)", 
+                           addr1, addr2)
     
     def _parse_jacuzzi_status(self, data: bytes) -> None:
         """Parse Jacuzzi status update (msg type 0x16).
@@ -349,11 +369,18 @@ class SundanceElfinClient:
         data[17] = light state
         """
         if len(data) < 20:
+            self._debug_log("JACUZZI STATUS TOO SHORT: len=%d (need 20)", len(data))
             return
+        
+        # Log all raw byte values for analysis
+        self._debug_log("JACUZZI RAW BYTES:")
+        for i in range(min(len(data), 25)):
+            self._debug_log("  data[%d] = 0x%02x (%d)", i, data[i], data[i])
         
         # Check if status changed (skip redundant updates)
         status_hex = data.hex()
         if self._prior_status and status_hex == self._prior_status.hex():
+            self._debug_log("JACUZZI STATUS UNCHANGED - skipping")
             return
         self._prior_status = data
         
@@ -364,72 +391,92 @@ class SundanceElfinClient:
             # Time
             self.state.time_hour = data[5]
             self.state.time_minute = data[6]
+            self._debug_log("TIME: %02d:%02d", data[5], data[6])
             
             # Date
             self.state.day_of_month = data[7] & 0x1F
             self.state.current_month = data[8]
             self.state.current_year = data[9] + 2000
+            self._debug_log("DATE: %d/%d/%d", data[8], data[7] & 0x1F, data[9] + 2000)
             
             # Heat mode and state
             self.state.heat_mode = (data[10] >> 4) & 0x03
             self.state.is_heating = self.state.heat_mode > 0
+            self._debug_log("HEAT: mode=%d heating=%s (raw byte[10]=0x%02x)", 
+                           self.state.heat_mode, self.state.is_heating, data[10])
             
             # Error code
             self.state.error_code = data[11]
+            if data[11] != 0:
+                self._debug_log("ERROR CODE: %d", data[11])
             
             # Current temperature (raw value)
             raw_temp = data[12]
+            self._debug_log("CURRENT TEMP RAW: data[12]=0x%02x (%d)", raw_temp, raw_temp)
+            
             if raw_temp != 0xFF:  # 0xFF = unknown/unavailable
                 # Temperature is stored as Fahrenheit / 2 when in Celsius mode
                 # Or direct Fahrenheit when in F mode
                 # Sundance typically uses Celsius, so value is F*2
                 # Convert: raw/2 = F, then (F-32)*5/9 = C
                 temp_f = raw_temp / 2.0 if self.state.temp_scale == TSCALE_C else raw_temp
-                self.state.current_temp = round((temp_f - 32) * 5 / 9, 1)
+                temp_c = round((temp_f - 32) * 5 / 9, 1)
+                self._debug_log("CURRENT TEMP CALC: raw=%d, temp_f=%.1f, temp_c=%.1f", 
+                               raw_temp, temp_f, temp_c)
+                self.state.current_temp = temp_c
             else:
+                self._debug_log("CURRENT TEMP: 0xFF = unavailable")
                 self.state.current_temp = None
             
             # Target temperature
             raw_settemp = data[14]
+            self._debug_log("TARGET TEMP RAW: data[14]=0x%02x (%d)", raw_settemp, raw_settemp)
+            
             if raw_settemp != 0xFF:
                 temp_f = raw_settemp / 2.0 if self.state.temp_scale == TSCALE_C else raw_settemp
-                self.state.target_temp = round((temp_f - 32) * 5 / 9, 1)
+                temp_c = round((temp_f - 32) * 5 / 9, 1)
+                self._debug_log("TARGET TEMP CALC: raw=%d, temp_f=%.1f, temp_c=%.1f", 
+                               raw_settemp, temp_f, temp_c)
+                self.state.target_temp = temp_c
             
             # Pump states from byte 15
             # Bits 7-6 = Pump 3
             # Bits 5-4 = Pump 2
             # Bits 3-2 = Pump 1
             pump_byte = data[15]
+            self._debug_log("PUMP BYTE: data[15]=0x%02x (%s)", pump_byte, bin(pump_byte))
+            
             self.state.pump3_speed = (pump_byte >> 6) & 0x03
             self.state.pump2_speed = (pump_byte >> 4) & 0x03
             self.state.pump1_speed = (pump_byte >> 2) & 0x03
+            self._debug_log("PUMPS: pump1=%d pump2=%d pump3=%d", 
+                           self.state.pump1_speed, self.state.pump2_speed, self.state.pump3_speed)
             
             # Circ pump from byte 16
             if len(data) > 16:
                 self.state.circ_pump_on = (data[16] & 0x02) != 0
+                self._debug_log("CIRC PUMP: data[16]=0x%02x, on=%s", data[16], self.state.circ_pump_on)
             
             # Light from byte 17
             if len(data) > 17:
                 self.state.light_on = (data[17] & 0x03) != 0
+                self._debug_log("LIGHT: data[17]=0x%02x, on=%s", data[17], self.state.light_on)
             
             self.state.status_updates += 1
             self.state.last_update = time.time()
             
-            self._log_rate_limited(logging.DEBUG, "status",
-                "Status: temp=%.1f/%.1f°C pump1=%d pump2=%d light=%s heat=%s",
+            self._debug_log("=== STATUS UPDATE #%d COMPLETE: temp=%.1f/%.1f C ===",
+                self.state.status_updates,
                 self.state.current_temp or 0,
-                self.state.target_temp or 0,
-                self.state.pump1_speed,
-                self.state.pump2_speed,
-                self.state.light_on,
-                self.state.is_heating
+                self.state.target_temp or 0
             )
             
             self._notify()
             
         except Exception as e:
-            self._log_rate_limited(logging.WARNING, "parse_err",
-                "Parse error: %s - %s", e, data.hex()[:40])
+            self._debug_log("PARSE ERROR: %s", e)
+            import traceback
+            self._debug_log("TRACEBACK: %s", traceback.format_exc())
     
     def _parse_balboa_status(self, data: bytes) -> None:
         """Parse Balboa status update (msg type 0x13).
@@ -503,7 +550,8 @@ class SundanceElfinClient:
         """Send a message to the spa."""
         async with self._lock:
             if not self._writer or not self.state.connected:
-                _LOGGER.error("Cannot send: not connected")
+                self._debug_log("SEND FAILED: not connected (writer=%s, connected=%s)", 
+                               self._writer is not None, self.state.connected)
                 return False
             
             # Build message: 7E [LEN] [DATA...] [CRC] 7E
@@ -515,13 +563,15 @@ class SundanceElfinClient:
             msg[-2] = self.balboa_calc_cs(msg[1:message_length], message_length - 1)
             msg[-1] = M_STARTEND
             
+            self._debug_log("SENDING MESSAGE: %s (bytes: %s)", msg.hex(), list(msg))
+            
             try:
-                _LOGGER.debug("Sending: %s", msg.hex())
                 self._writer.write(msg)
                 await self._writer.drain()
+                self._debug_log("SEND SUCCESS")
                 return True
             except Exception as e:
-                _LOGGER.error("Send failed: %s", e)
+                self._debug_log("SEND EXCEPTION: %s", e)
                 self.state.connected = False
                 self._notify()
                 return False
@@ -534,45 +584,51 @@ class SundanceElfinClient:
         
         For WiFi module, channel is typically 0x0A.
         """
+        self._debug_log("BUTTON PRESS: button=0x%02x (%s)", button, 
+                       {C_PUMP1: 'PUMP1', C_PUMP2: 'PUMP2', C_LIGHT1: 'LIGHT', 
+                        C_TEMP_UP: 'TEMP_UP', C_TEMP_DOWN: 'TEMP_DOWN'}.get(button, 'UNKNOWN'))
         # 0x0A = WiFi module channel, 0xBF = always, 0x17 = button press msg type
         return await self.send_message(0x0A, 0xBF, 0x17, button)
     
     async def toggle_pump1(self) -> bool:
         """Toggle pump 1."""
-        _LOGGER.info("Toggling pump 1")
+        self._debug_log("TOGGLE PUMP1 called (current speed=%d)", self.state.pump1_speed)
         result = await self.send_button(C_PUMP1)
         if result:
             # Optimistic update
             self.state.pump1_speed = (self.state.pump1_speed + 1) % 3
+            self._debug_log("PUMP1 optimistic update: new speed=%d", self.state.pump1_speed)
             self._notify()
         return result
     
     async def toggle_pump2(self) -> bool:
         """Toggle pump 2."""
-        _LOGGER.info("Toggling pump 2")
+        self._debug_log("TOGGLE PUMP2 called (current speed=%d)", self.state.pump2_speed)
         result = await self.send_button(C_PUMP2)
         if result:
             self.state.pump2_speed = (self.state.pump2_speed + 1) % 3
+            self._debug_log("PUMP2 optimistic update: new speed=%d", self.state.pump2_speed)
             self._notify()
         return result
     
     async def toggle_light(self) -> bool:
         """Toggle light."""
-        _LOGGER.info("Toggling light")
+        self._debug_log("TOGGLE LIGHT called (current state=%s)", self.state.light_on)
         result = await self.send_button(C_LIGHT1)
         if result:
             self.state.light_on = not self.state.light_on
+            self._debug_log("LIGHT optimistic update: new state=%s", self.state.light_on)
             self._notify()
         return result
     
     async def increase_temp(self) -> bool:
         """Increase target temperature."""
-        _LOGGER.info("Increasing temperature")
+        self._debug_log("INCREASE TEMP called (current target=%.1f)", self.state.target_temp or 0)
         return await self.send_button(C_TEMP_UP)
     
     async def decrease_temp(self) -> bool:
         """Decrease target temperature."""
-        _LOGGER.info("Decreasing temperature")
+        self._debug_log("DECREASE TEMP called (current target=%.1f)", self.state.target_temp or 0)
         return await self.send_button(C_TEMP_DOWN)
     
     async def set_target_temperature(self, temp_c: float) -> bool:
