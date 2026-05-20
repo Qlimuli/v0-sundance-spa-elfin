@@ -3,52 +3,89 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from dataclasses import dataclass, field
 from typing import Callable
 
 from .const import (
+    ADDR_BROADCAST,
+    ADDR_PANEL,
+    BTN_LIGHT,
+    BTN_PUMP1,
+    BTN_PUMP2,
+    BTN_TEMP_DOWN,
+    BTN_TEMP_UP,
     CONNECTION_TIMEOUT,
-    MSG_SET_TEMP,
-    MSG_TOGGLE_LIGHT,
-    MSG_TOGGLE_PUMP1,
-    MSG_TOGGLE_PUMP2,
-    PACKET_END,
-    PACKET_START,
+    FRAME_START,
+    FRAME_START_BYTE,
+    MASK_HEATING,
+    MASK_LIGHT,
+    MASK_PUMP1_HIGH,
+    MASK_PUMP1_LOW,
+    MASK_PUMP2_HIGH,
+    MASK_PUMP2_LOW,
+    MSG_BUTTON_PRESS,
+    MSG_HEARTBEAT,
+    MSG_STATUS_LEN_34,
+    MSG_STATUS_LEN_38,
     POS_CURRENT_TEMP,
-    POS_HEATING_STATE,
+    POS_FLAGS1,
     POS_LIGHT_STATE,
-    POS_PUMP1_STATE,
-    POS_PUMP2_STATE,
     POS_TARGET_TEMP,
     RECONNECT_INTERVAL,
 )
 
 _LOGGER = logging.getLogger(__name__)
 
+# Rate limiting for logging to prevent "logging too frequently" warnings
+_last_log_time: dict[str, float] = {}
+_LOG_INTERVAL = 10.0  # Minimum seconds between identical log messages
+
+
+def _rate_limited_log(level: int, key: str, msg: str, *args) -> None:
+    """Log a message with rate limiting to prevent spam."""
+    now = time.time()
+    if key in _last_log_time and (now - _last_log_time[key]) < _LOG_INTERVAL:
+        return
+    _last_log_time[key] = now
+    _LOGGER.log(level, msg, *args)
+
 
 @dataclass
 class SpaState:
     """Data class holding the current spa state."""
 
-    current_temp: float = 0.0
-    target_temp: float = 37.0
+    current_temp: float | None = None  # None = unknown
+    target_temp: float | None = None
     is_heating: bool = False
-    pump1_on: bool = False
-    pump2_on: bool = False
+    pump1_speed: int = 0  # 0=off, 1=low, 2=high
+    pump2_speed: int = 0
     light_on: bool = False
     connected: bool = False
     last_update: float = 0.0
+    raw_packets_received: int = 0
+    status_packets_parsed: int = 0
+
+    @property
+    def pump1_on(self) -> bool:
+        """Return True if pump1 is running at any speed."""
+        return self.pump1_speed > 0
+
+    @property
+    def pump2_on(self) -> bool:
+        """Return True if pump2 is running at any speed."""
+        return self.pump2_speed > 0
 
 
 @dataclass
 class SundanceElfinClient:
     """Async TCP client for Elfin-EW11A RS485 adapter.
     
-    This client maintains a persistent TCP connection to the Elfin adapter,
-    reads incoming RS485 data packets, and sends control commands.
-    
-    The protocol parsing methods are designed as placeholders that you can
-    customize with the actual hex codes from your Sundance/Jacuzzi spa.
+    Implements the Sundance/Jacuzzi RS485 protocol based on observed packets:
+    - Frame start: 0x7E 0x7E
+    - Byte 0: Length of packet (including length byte, excluding frame start)
+    - Byte 1-2: Addresses (0xFF 0xAF for status broadcasts)
+    - Byte 3+: Message data
     """
 
     host: str
@@ -63,10 +100,7 @@ class SundanceElfinClient:
     _lock: asyncio.Lock = field(default_factory=asyncio.Lock, repr=False)
 
     def register_callback(self, callback: Callable[[], None]) -> Callable[[], None]:
-        """Register a callback to be called when state changes.
-        
-        Returns a function to unregister the callback.
-        """
+        """Register a callback to be called when state changes."""
         self._callbacks.append(callback)
         
         def unregister() -> None:
@@ -147,35 +181,34 @@ class SundanceElfinClient:
                     await self._reconnect()
                     continue
                 
-                # Read data from the stream
                 try:
                     data = await asyncio.wait_for(
-                        self._reader.read(256),
+                        self._reader.read(512),
                         timeout=30.0,
                     )
                 except asyncio.TimeoutError:
-                    # No data received, but connection might still be alive
                     continue
                 
                 if not data:
-                    # Connection closed by remote
                     _LOGGER.warning("Connection closed by Elfin adapter")
                     self.state.connected = False
                     self._notify_callbacks()
                     await self._reconnect()
                     continue
                 
-                # Add received data to buffer
                 buffer.extend(data)
-                _LOGGER.debug("Received %d bytes: %s", len(data), data.hex())
+                self.state.raw_packets_received += 1
                 
-                # Process complete packets in buffer
-                buffer = await self._process_buffer(buffer)
+                # Process complete packets
+                buffer = self._process_buffer(buffer)
                 
             except asyncio.CancelledError:
                 break
             except Exception as err:
-                _LOGGER.exception("Error in listen loop: %s", err)
+                _rate_limited_log(
+                    logging.ERROR, "listen_error",
+                    "Error in listen loop: %s", err
+                )
                 self.state.connected = False
                 self._notify_callbacks()
                 await self._reconnect()
@@ -191,178 +224,249 @@ class SundanceElfinClient:
         if self._running:
             await self.connect()
 
-    async def _process_buffer(self, buffer: bytearray) -> bytearray:
+    def _process_buffer(self, buffer: bytearray) -> bytearray:
         """Process the receive buffer and extract complete packets.
         
-        This method looks for complete packets in the buffer and processes them.
-        Returns the remaining unprocessed bytes.
+        Packet format observed:
+        7E 7E [LEN] [ADDR1] [ADDR2] [DATA...] 
         
-        CUSTOMIZE THIS: Update the packet detection logic based on your
-        spa's actual protocol format.
+        Where LEN is the total packet length after the 7E7E prefix.
         """
-        # Example packet structure (PLACEHOLDER - adjust to real protocol):
-        # [START_BYTE] [LENGTH] [MSG_TYPE] [DATA...] [CHECKSUM] [END_BYTE]
-        
-        while len(buffer) >= 6:  # Minimum packet size
-            # Look for packet start
-            start_idx = -1
-            for i, byte in enumerate(buffer):
-                if byte == PACKET_START:
-                    start_idx = i
-                    break
+        while len(buffer) >= 4:
+            # Find frame start (7E 7E)
+            start_idx = buffer.find(FRAME_START)
             
             if start_idx == -1:
-                # No start byte found, clear buffer
-                buffer.clear()
-                break
+                # No frame start found, keep last byte in case it's a partial 7E
+                if buffer and buffer[-1] == FRAME_START_BYTE:
+                    return buffer[-1:]
+                return bytearray()
             
-            # Remove any garbage before start byte
+            # Remove garbage before frame start
             if start_idx > 0:
                 buffer = buffer[start_idx:]
             
-            if len(buffer) < 2:
+            if len(buffer) < 3:
                 break
             
-            # Get packet length (PLACEHOLDER - adjust to real protocol)
-            packet_length = buffer[1]
+            # Get packet length (byte after 7E7E)
+            packet_len = buffer[2]
             
-            if len(buffer) < packet_length:
+            # Validate length (reasonable bounds)
+            if packet_len < 3 or packet_len > 100:
+                # Invalid length, skip this frame start and look for next
+                buffer = buffer[2:]
+                continue
+            
+            # Total bytes needed: 2 (frame start) + packet_len
+            total_needed = 2 + packet_len
+            
+            if len(buffer) < total_needed:
                 # Incomplete packet, wait for more data
                 break
             
-            # Extract complete packet
-            packet = bytes(buffer[:packet_length])
-            buffer = buffer[packet_length:]
+            # Extract complete packet (excluding 7E7E prefix)
+            packet = bytes(buffer[2:total_needed])
+            buffer = buffer[total_needed:]
             
             # Parse the packet
-            self._parse_status_packet(packet)
+            self._parse_packet(packet)
         
         return buffer
+
+    def _parse_packet(self, packet: bytes) -> None:
+        """Parse a packet and update state if it's a status packet."""
+        if len(packet) < 4:
+            return
+        
+        length = packet[0]
+        
+        # Check for status packets (length 0x22=34 or 0x26=38)
+        if length in (MSG_STATUS_LEN_34, MSG_STATUS_LEN_38):
+            # This is likely a status packet
+            if len(packet) >= 2 and packet[1] == ADDR_BROADCAST and packet[2] == ADDR_PANEL:
+                self._parse_status_packet(packet)
+        elif length == MSG_HEARTBEAT:
+            # Heartbeat packet (0510bf...) - just acknowledge connection is alive
+            pass
+        else:
+            # Log unknown packet types occasionally for debugging
+            _rate_limited_log(
+                logging.DEBUG, f"unknown_pkt_{length}",
+                "Unknown packet type (len=%d): %s", length, packet[:20].hex()
+            )
 
     def _parse_status_packet(self, packet: bytes) -> None:
         """Parse a status packet and update the spa state.
         
-        CUSTOMIZE THIS: Update the byte positions and value interpretations
-        based on your spa's actual protocol.
+        Observed 38-byte status packet structure:
+        7e7e 26 ff af c4 0f 1c 0b 0a 85 07 9d fc 07 00 46 00 3d 1c bf 1b 22 18 1b 00 32 14 2d 16 11 10 13 17 73 6c 2f 2e 29 04 7e
         
-        Common Sundance/Jacuzzi packet structure hints:
-        - Temperature values are often raw bytes where value = byte_value / 2 (for °F)
-        - Or might need conversion: temp_c = (raw_value - 32) * 5 / 9
-        - Pump/light states are usually single bits in a status byte
+        Byte positions (after 7E7E, so packet[0] = length byte):
+        [0] = 0x26 (38) - length
+        [1] = 0xFF - broadcast address
+        [2] = 0xAF - panel address  
+        [3] = 0xC4 - message type/subtype
+        [4] = 0x0F - ? 
+        [5] = 0x1C - ? (28)
+        [6] = 0x0B - current temp raw? (11 -> could be index or encoded)
+        [7] = 0x0A - target temp raw?
+        ...
         
-        Example packet structure from HyperActiveJ/Jacuzzi-RS485:
-        - Byte 0: Start marker (0x7E)
-        - Byte 1: Packet length
-        - Byte 2: Message type
-        - Byte 3-4: Source/destination addresses
-        - Byte 5+: Data payload
-        - Last byte: Checksum
+        Temperature encoding needs verification - trying multiple approaches.
         """
-        if len(packet) < 10:
-            _LOGGER.debug("Packet too short to parse: %s", packet.hex())
+        if len(packet) < 20:
             return
         
         try:
-            msg_type = packet[2] if len(packet) > 2 else 0
+            state_changed = False
             
-            # Only process status messages (PLACEHOLDER value)
-            if msg_type == MSG_STATUS:
-                # Extract temperature values (PLACEHOLDER positions and conversion)
-                # Many spas report temp as raw byte / 2 for Fahrenheit
-                raw_current = packet[POS_CURRENT_TEMP] if len(packet) > POS_CURRENT_TEMP else 0
-                raw_target = packet[POS_TARGET_TEMP] if len(packet) > POS_TARGET_TEMP else 0
+            # Try to extract temperatures
+            # Common encodings: raw/2 for F, direct C, or lookup table
+            # Let's try positions 6 and 7 first as observed
+            
+            if len(packet) > POS_TARGET_TEMP:
+                raw_current = packet[POS_CURRENT_TEMP]
+                raw_target = packet[POS_TARGET_TEMP]
                 
-                # Convert to Celsius (assuming input is Fahrenheit * 2)
-                # Adjust this formula based on your spa's encoding
-                self.state.current_temp = self._raw_to_celsius(raw_current)
-                self.state.target_temp = self._raw_to_celsius(raw_target)
+                # Try direct Fahrenheit / 2 conversion (common in Balboa/Jacuzzi)
+                # Values like 0x0B (11) seem too low for temp
+                # Try treating as direct value or with offset
                 
-                # Extract pump/light/heating states (PLACEHOLDER bit positions)
-                status_byte = packet[POS_HEATING_STATE] if len(packet) > POS_HEATING_STATE else 0
-                self.state.is_heating = bool(status_byte & 0x01)  # Bit 0 = heating
+                # Attempt 1: If values > 50, might be direct F
+                # Attempt 2: If values < 50, might need different position
                 
-                pump_byte = packet[POS_PUMP1_STATE] if len(packet) > POS_PUMP1_STATE else 0
-                self.state.pump1_on = bool(pump_byte & 0x01)  # Bit 0 = pump1
-                self.state.pump2_on = bool(pump_byte & 0x02)  # Bit 1 = pump2
+                # Look for reasonable temperature bytes (26-40C = 79-104F = 158-208 raw if *2)
+                # Or 79-104 raw if direct F
                 
-                light_byte = packet[POS_LIGHT_STATE] if len(packet) > POS_LIGHT_STATE else 0
-                self.state.light_on = bool(light_byte & 0x01)  # Bit 0 = light
+                # Scan packet for temperature-like values
+                temp_candidates = []
+                for i, b in enumerate(packet[4:25]):
+                    # Looking for values that could be temps
+                    # Direct C: 26-42 range
+                    # F/2: 79-104 range (39-52)
+                    # Direct F: 79-104
+                    if 26 <= b <= 50:  # Could be C or F/2
+                        temp_candidates.append((i + 4, b, "C_or_F2"))
+                    elif 70 <= b <= 110:  # Could be direct F
+                        temp_candidates.append((i + 4, b, "direct_F"))
                 
-                import time
-                self.state.last_update = time.time()
+                if temp_candidates:
+                    _rate_limited_log(
+                        logging.DEBUG, "temp_candidates",
+                        "Temperature candidates in packet: %s", temp_candidates
+                    )
                 
-                _LOGGER.debug(
-                    "Parsed state: temp=%.1f°C, target=%.1f°C, heating=%s, "
-                    "pump1=%s, pump2=%s, light=%s",
-                    self.state.current_temp,
-                    self.state.target_temp,
-                    self.state.is_heating,
-                    self.state.pump1_on,
-                    self.state.pump2_on,
-                    self.state.light_on,
-                )
+                # For now, try a few common positions
+                # Position 6-7 from observations
+                if 60 <= raw_current <= 110:  # Direct Fahrenheit
+                    self.state.current_temp = round((raw_current - 32) * 5 / 9, 1)
+                    state_changed = True
+                elif 26 <= raw_current <= 50:  # Direct Celsius or F/2
+                    # Try F/2 first (more common)
+                    temp_f = raw_current * 2
+                    self.state.current_temp = round((temp_f - 32) * 5 / 9, 1)
+                    state_changed = True
                 
+                if 60 <= raw_target <= 110:
+                    self.state.target_temp = round((raw_target - 32) * 5 / 9, 1)
+                    state_changed = True
+                elif 26 <= raw_target <= 50:
+                    temp_f = raw_target * 2
+                    self.state.target_temp = round((temp_f - 32) * 5 / 9, 1)
+                    state_changed = True
+            
+            # Parse flags for pump/light/heating states
+            if len(packet) > POS_FLAGS1:
+                flags1 = packet[POS_FLAGS1]
+                
+                # Pump 1: bits 0-1 for off/low/high
+                pump1_bits = flags1 & (MASK_PUMP1_LOW | MASK_PUMP1_HIGH)
+                if pump1_bits == 0:
+                    self.state.pump1_speed = 0
+                elif pump1_bits == MASK_PUMP1_LOW:
+                    self.state.pump1_speed = 1
+                else:
+                    self.state.pump1_speed = 2
+                
+                # Pump 2: bits 2-3
+                pump2_bits = flags1 & (MASK_PUMP2_LOW | MASK_PUMP2_HIGH)
+                if pump2_bits == 0:
+                    self.state.pump2_speed = 0
+                elif pump2_bits == MASK_PUMP2_LOW:
+                    self.state.pump2_speed = 1
+                else:
+                    self.state.pump2_speed = 2
+                
+                # Heating: bits 4-5
+                self.state.is_heating = bool(flags1 & MASK_HEATING)
+                
+                state_changed = True
+            
+            # Light state
+            if len(packet) > POS_LIGHT_STATE:
+                light_byte = packet[POS_LIGHT_STATE]
+                self.state.light_on = bool(light_byte & MASK_LIGHT)
+                state_changed = True
+            
+            self.state.last_update = time.time()
+            self.state.status_packets_parsed += 1
+            
+            # Log parsed state periodically
+            _rate_limited_log(
+                logging.DEBUG, "parsed_state",
+                "Status: temp=%.1f/%.1f°C, heat=%s, pump1=%d, pump2=%d, light=%s",
+                self.state.current_temp or 0,
+                self.state.target_temp or 0,
+                self.state.is_heating,
+                self.state.pump1_speed,
+                self.state.pump2_speed,
+                self.state.light_on,
+            )
+            
+            if state_changed:
                 self._notify_callbacks()
                 
         except Exception as err:
-            _LOGGER.warning("Failed to parse status packet: %s - %s", packet.hex(), err)
-
-    def _raw_to_celsius(self, raw_value: int) -> float:
-        """Convert raw temperature byte to Celsius.
-        
-        CUSTOMIZE THIS: Adjust the conversion formula based on your spa's encoding.
-        
-        Common encodings:
-        - raw_value / 2 = Fahrenheit, then convert to Celsius
-        - raw_value directly in Fahrenheit
-        - raw_value directly in Celsius * 2
-        """
-        # Assuming raw value is Fahrenheit * 2
-        fahrenheit = raw_value / 2.0
-        celsius = (fahrenheit - 32) * 5 / 9
-        return round(celsius, 1)
-
-    def _celsius_to_raw(self, celsius: float) -> int:
-        """Convert Celsius temperature to raw byte value.
-        
-        CUSTOMIZE THIS: Adjust based on your spa's encoding.
-        """
-        fahrenheit = (celsius * 9 / 5) + 32
-        return int(fahrenheit * 2)
+            _rate_limited_log(
+                logging.WARNING, "parse_error",
+                "Failed to parse status: %s - %s", packet.hex()[:40], err
+            )
 
     def _calculate_checksum(self, data: bytes) -> int:
-        """Calculate checksum for outgoing packet.
-        
-        CUSTOMIZE THIS: Implement the actual checksum algorithm used by your spa.
-        Common methods:
-        - Simple XOR of all bytes
-        - Sum of all bytes modulo 256
-        - CRC-8 or CRC-16
-        """
-        # Example: Simple XOR checksum (PLACEHOLDER)
-        checksum = 0
+        """Calculate CRC-8 checksum (common in Balboa/Jacuzzi protocol)."""
+        # CRC-8 with polynomial 0x07 (common for spa protocols)
+        crc = 0x02  # Initial value
         for byte in data:
-            checksum ^= byte
-        return checksum
+            crc ^= byte
+            for _ in range(8):
+                if crc & 0x80:
+                    crc = (crc << 1) ^ 0x07
+                else:
+                    crc <<= 1
+                crc &= 0xFF
+        return crc ^ 0x02
 
-    def _build_command(self, msg_type: int, payload: bytes = b"") -> bytes:
-        """Build a command packet to send to the spa.
+    def _build_command(self, button_code: int) -> bytes:
+        """Build a button press command packet.
         
-        CUSTOMIZE THIS: Adjust the packet structure based on your spa's protocol.
-        
-        Example structure:
-        [START] [LENGTH] [MSG_TYPE] [SRC] [DST] [PAYLOAD...] [CHECKSUM] [END]
+        Command format (based on Jacuzzi protocol):
+        7E 7E [LEN] [DST] [SRC] [MSG_TYPE] [BUTTON] [CHECKSUM]
         """
-        # Build packet without checksum
-        src_addr = 0x0A  # PLACEHOLDER - your controller address
-        dst_addr = 0x00  # PLACEHOLDER - spa main board address
+        src_addr = 0x0A  # Controller/client address
+        dst_addr = ADDR_PANEL
         
-        packet_data = bytes([msg_type, src_addr, dst_addr]) + payload
-        length = len(packet_data) + 3  # +3 for start, length, checksum
+        # Build packet data (after 7E7E)
+        packet_data = bytes([
+            0x06,  # Length (6 bytes after 7E7E)
+            dst_addr,
+            src_addr,
+            MSG_BUTTON_PRESS,
+            button_code,
+        ])
         
-        packet = bytes([PACKET_START, length]) + packet_data
-        checksum = self._calculate_checksum(packet)
-        packet = packet + bytes([checksum, PACKET_END])
+        checksum = self._calculate_checksum(packet_data)
+        packet = FRAME_START + packet_data + bytes([checksum])
         
         return packet
 
@@ -385,73 +489,90 @@ class SundanceElfinClient:
                 return False
 
     async def set_target_temperature(self, temperature: float) -> bool:
-        """Set the target water temperature.
+        """Set the target water temperature by sending temp up/down buttons."""
+        if self.state.target_temp is None:
+            _LOGGER.warning("Cannot set temperature: current target unknown")
+            return False
         
-        Args:
-            temperature: Target temperature in Celsius
-        """
-        raw_temp = self._celsius_to_raw(temperature)
-        payload = bytes([raw_temp])
-        command = self._build_command(MSG_SET_TEMP, payload)
+        current = self.state.target_temp
+        diff = temperature - current
         
-        _LOGGER.info("Setting target temperature to %.1f°C (raw: %d)", temperature, raw_temp)
+        # Send appropriate number of temp up/down button presses
+        # Most spas change by 0.5°C or 1°F per press
+        steps = int(abs(diff) / 0.5)
+        button = BTN_TEMP_UP if diff > 0 else BTN_TEMP_DOWN
         
-        if await self._send_command(command):
-            # Optimistically update local state
-            self.state.target_temp = temperature
-            self._notify_callbacks()
-            return True
-        return False
+        _LOGGER.info(
+            "Setting temperature from %.1f to %.1f°C (%d steps)",
+            current, temperature, steps
+        )
+        
+        for _ in range(min(steps, 20)):  # Limit to 20 presses max
+            command = self._build_command(button)
+            if not await self._send_command(command):
+                return False
+            await asyncio.sleep(0.3)  # Small delay between button presses
+        
+        # Optimistically update
+        self.state.target_temp = temperature
+        self._notify_callbacks()
+        return True
 
     async def toggle_pump1(self) -> bool:
-        """Toggle pump 1 on/off."""
-        command = self._build_command(MSG_TOGGLE_PUMP1)
-        
+        """Toggle pump 1."""
+        command = self._build_command(BTN_PUMP1)
         _LOGGER.info("Toggling pump 1")
         
         if await self._send_command(command):
-            # Optimistically update local state
-            self.state.pump1_on = not self.state.pump1_on
+            # Cycle through speeds: 0 -> 1 -> 2 -> 0
+            self.state.pump1_speed = (self.state.pump1_speed + 1) % 3
             self._notify_callbacks()
             return True
         return False
 
     async def toggle_pump2(self) -> bool:
-        """Toggle pump 2 on/off."""
-        command = self._build_command(MSG_TOGGLE_PUMP2)
-        
+        """Toggle pump 2."""
+        command = self._build_command(BTN_PUMP2)
         _LOGGER.info("Toggling pump 2")
         
         if await self._send_command(command):
-            # Optimistically update local state
-            self.state.pump2_on = not self.state.pump2_on
+            self.state.pump2_speed = (self.state.pump2_speed + 1) % 3
             self._notify_callbacks()
             return True
         return False
 
     async def toggle_light(self) -> bool:
-        """Toggle the spa light on/off."""
-        command = self._build_command(MSG_TOGGLE_LIGHT)
-        
+        """Toggle the spa light."""
+        command = self._build_command(BTN_LIGHT)
         _LOGGER.info("Toggling light")
         
         if await self._send_command(command):
-            # Optimistically update local state
             self.state.light_on = not self.state.light_on
             self._notify_callbacks()
             return True
         return False
 
     async def set_pump1(self, on: bool) -> bool:
-        """Set pump 1 to a specific state."""
-        if self.state.pump1_on != on:
+        """Set pump 1 to on or off."""
+        if on and self.state.pump1_speed == 0:
             return await self.toggle_pump1()
+        elif not on and self.state.pump1_speed > 0:
+            # Toggle until off
+            while self.state.pump1_speed > 0:
+                if not await self.toggle_pump1():
+                    return False
+                await asyncio.sleep(0.5)
         return True
 
     async def set_pump2(self, on: bool) -> bool:
-        """Set pump 2 to a specific state."""
-        if self.state.pump2_on != on:
+        """Set pump 2 to on or off."""
+        if on and self.state.pump2_speed == 0:
             return await self.toggle_pump2()
+        elif not on and self.state.pump2_speed > 0:
+            while self.state.pump2_speed > 0:
+                if not await self.toggle_pump2():
+                    return False
+                await asyncio.sleep(0.5)
         return True
 
     async def set_light(self, on: bool) -> bool:
