@@ -73,6 +73,11 @@
       "spa_time": {
         "name": "Spa Time"
       }
+    },
+    "number": {
+      "set_temperature": {
+        "name": "Set Temperature"
+      }
     }
   }
 }

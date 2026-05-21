@@ -1,6 +1,7 @@
 """Switch platform for Sundance Spa (pumps, blower, etc.)."""
 from __future__ import annotations
 
+import asyncio
 import logging
 
 from homeassistant.components.switch import SwitchEntity
@@ -90,7 +91,6 @@ class SundancePumpSwitch(SundanceEntity, SwitchEntity):
                 break
             await self._spa.toggle_pump(self._pump_num)
             # Wait for state update
-            import asyncio
             await asyncio.sleep(0.5)
             pump_state = getattr(self._spa.status, f"pump{self._pump_num}", PumpState.OFF)
 

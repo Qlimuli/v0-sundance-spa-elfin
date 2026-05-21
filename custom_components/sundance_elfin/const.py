@@ -73,6 +73,9 @@ SETTINGS_INFO: Final = 0x02
 SETTINGS_PREFS: Final = 0x08
 SETTINGS_FAULT_LOG: Final = 0x20
 
+# Panel Request Types (for requesting panel registration)
+PANEL_REQ: Final = 0x00
+
 # Heat Modes
 HEAT_MODE_READY: Final = 0
 HEAT_MODE_REST: Final = 1

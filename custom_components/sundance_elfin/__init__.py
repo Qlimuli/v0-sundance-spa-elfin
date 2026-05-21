@@ -20,6 +20,7 @@ PLATFORMS: list[Platform] = [
     Platform.LIGHT,
     Platform.BINARY_SENSOR,
     Platform.SENSOR,
+    Platform.NUMBER,
 ]
 
 type SundanceConfigEntry = ConfigEntry[SpaClient]
