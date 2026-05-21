@@ -40,6 +40,9 @@ MSG_TYPE_INFO_RESP: Final = 0x24
 MSG_TYPE_PREFS_RESP: Final = 0x26
 MSG_TYPE_SET_PREF: Final = 0x27
 MSG_TYPE_FAULT_LOG: Final = 0x28
+# FIX: Older Balboa firmware sends config response as 0x0C, newer as 0x2E.
+# The Sundance Cameo 880 may use either – we handle both.
+MSG_TYPE_CONFIG_RESP_LEGACY: Final = 0x0C
 MSG_TYPE_CONFIG_RESP: Final = 0x2E
 
 # Channels
