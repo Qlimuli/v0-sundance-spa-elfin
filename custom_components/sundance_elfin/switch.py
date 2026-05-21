@@ -10,7 +10,7 @@ from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
 from . import SundanceConfigEntry
 from .entity import SundanceEntity
-from .spa_client import SpaClient, PumpState
+from .spa_client import SpaClient
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -27,12 +27,10 @@ async def async_setup_entry(
     # Add pumps based on configuration
     config = spa.config
     
-    if config.pump1_speeds > 0:
-        entities.append(SundancePumpSwitch(spa, entry.entry_id, 1))
-    if config.pump2_speeds > 0:
-        entities.append(SundancePumpSwitch(spa, entry.entry_id, 2))
-    if config.pump3_speeds > 0:
-        entities.append(SundancePumpSwitch(spa, entry.entry_id, 3))
+    # pump_speeds is a list [pump1_speeds, pump2_speeds, ...]
+    for i, speeds in enumerate(config.pump_speeds):
+        if speeds > 0:
+            entities.append(SundancePumpSwitch(spa, entry.entry_id, i + 1))
     
     # Add blower if available
     if config.has_blower:
@@ -40,9 +38,10 @@ async def async_setup_entry(
 
     # If no pumps detected in config, add defaults for Sundance Cameo 880
     if not entities:
-        _LOGGER.info("No pump config detected, adding default pumps (1, 2)")
+        _LOGGER.info("No pump config detected, adding default pumps (1, 2, 3)")
         entities.append(SundancePumpSwitch(spa, entry.entry_id, 1))
         entities.append(SundancePumpSwitch(spa, entry.entry_id, 2))
+        entities.append(SundancePumpSwitch(spa, entry.entry_id, 3))
 
     async_add_entities(entities)
 
@@ -61,16 +60,17 @@ class SundancePumpSwitch(SundanceEntity, SwitchEntity):
     def is_on(self) -> bool:
         """Return true if pump is on."""
         status = self._spa.status
-        pump_state = getattr(status, f"pump{self._pump_num}", PumpState.OFF)
-        return pump_state != PumpState.OFF
+        pump_state = getattr(status, f"pump{self._pump_num}", 0)
+        return pump_state > 0
 
     @property
     def extra_state_attributes(self) -> dict:
         """Return extra state attributes."""
         status = self._spa.status
-        pump_state = getattr(status, f"pump{self._pump_num}", PumpState.OFF)
+        pump_state = getattr(status, f"pump{self._pump_num}", 0)
+        speed_names = {0: "OFF", 1: "LOW", 2: "HIGH"}
         return {
-            "speed": pump_state.name if pump_state else "OFF"
+            "speed": speed_names.get(pump_state, f"Unknown ({pump_state})")
         }
 
     async def async_turn_on(self, **kwargs) -> None:
@@ -82,17 +82,17 @@ class SundancePumpSwitch(SundanceEntity, SwitchEntity):
         """Turn pump off."""
         # Toggle until off (pumps cycle: off -> low -> high -> off)
         status = self._spa.status
-        pump_state = getattr(status, f"pump{self._pump_num}", PumpState.OFF)
+        pump_state = getattr(status, f"pump{self._pump_num}", 0)
         
         # Keep toggling until off
         max_toggles = 3
         for _ in range(max_toggles):
-            if pump_state == PumpState.OFF:
+            if pump_state == 0:
                 break
             await self._spa.toggle_pump(self._pump_num)
             # Wait for state update
             await asyncio.sleep(0.5)
-            pump_state = getattr(self._spa.status, f"pump{self._pump_num}", PumpState.OFF)
+            pump_state = getattr(self._spa.status, f"pump{self._pump_num}", 0)
 
 
 class SundanceBlowerSwitch(SundanceEntity, SwitchEntity):

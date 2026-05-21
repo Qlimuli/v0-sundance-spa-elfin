@@ -1,72 +1,69 @@
-"""Balboa protocol implementation for Sundance Spa via EW11 RS485-to-TCP bridge."""
+"""Balboa protocol implementation for Sundance Spa via EW11 RS485-to-TCP bridge.
+
+Based on the protocol used by balboa_worldwide_app (https://github.com/ccutrer/balboa_worldwide_app)
+which is also used by bwalink (https://github.com/jshank/bwalink).
+
+The Balboa protocol is a simple framed message protocol:
+- Start delimiter: 0x7E (~)
+- Length byte (includes everything from length to checksum, excluding delimiters)
+- Source address (0x0A for WiFi clients)
+- Message type (2 bytes)
+- Payload (variable)
+- CRC-8 checksum
+- End delimiter: 0x7E (~)
+"""
 from __future__ import annotations
 
 import asyncio
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Callable
 from enum import IntEnum
-import struct
-
-from .const import (
-    MSG_DELIMITER,
-    MSG_TYPE_STATUS_UPDATE,
-    MSG_TYPE_TOGGLE_ITEM,
-    MSG_TYPE_SET_TEMP,
-    MSG_TYPE_SETTINGS_REQ,
-    MSG_TYPE_CONFIG_RESP,
-    MSG_TYPE_CONFIG_RESP_LEGACY,
-    MSG_TYPE_INFO_RESP,
-    MSG_TYPE_CTS,
-    MSG_TYPE_NTS,
-    MSG_TYPE_CHANNEL_ASSIGN_REQ,
-    MSG_TYPE_CHANNEL_ASSIGN_RESP,
-    MSG_TYPE_CHANNEL_ASSIGN_ACK,
-    MSG_TYPE_NEW_CLIENT_CTS,
-    CHANNEL_BROADCAST,
-    CHANNEL_MULTICAST,
-    CHANNEL_WIFI,
-    ITEM_PUMP_1,
-    ITEM_PUMP_2,
-    ITEM_PUMP_3,
-    ITEM_LIGHT_1,
-    ITEM_LIGHT_2,
-    ITEM_BLOWER,
-    ITEM_TEMP_RANGE,
-    ITEM_HEAT_MODE,
-    SETTINGS_CONFIG,
-    SETTINGS_INFO,
-    HEAT_MODE_READY,
-    HEAT_MODE_REST,
-    HEAT_MODE_READY_IN_REST,
-    HEAT_STATE_OFF,
-    HEAT_STATE_HEATING,
-    HEAT_STATE_HEAT_WAITING,
-    TEMP_RANGE_LOW,
-    TEMP_RANGE_HIGH,
-)
 
 _LOGGER = logging.getLogger(__name__)
+
+# Message delimiters
+MSG_START = 0x7E
+MSG_END = 0x7E
+
+# Message types (2 bytes combined, but we use the second byte as the type ID)
+# Format: 0xAF <type>
+MSG_TYPE_STATUS = 0x13          # Status update from spa (0xAF 0x13)
+MSG_TYPE_FILTER_CYCLES = 0x23   # Filter cycles info
+MSG_TYPE_INFO = 0x24            # System info response
+MSG_TYPE_SETTINGS = 0x25        # Settings response
+MSG_TYPE_SETUP_PARAMS = 0x26    # Setup parameters
+MSG_TYPE_CONFIG = 0x2E          # Configuration response (Control Configuration 2)
+MSG_TYPE_CONFIG_REQ = 0x04      # Configuration request (what we send)
+MSG_TYPE_TOGGLE_ITEM = 0x11     # Toggle item command
+MSG_TYPE_SET_TEMP = 0x20        # Set temperature command
+MSG_TYPE_SET_TIME = 0x21        # Set time command
+MSG_TYPE_SET_TEMP_SCALE = 0x27  # Set temperature scale
+MSG_TYPE_READY = 0x14           # Ready to receive (Clear-To-Send)
+MSG_TYPE_NOTHING_TO_SEND = 0x06 # Nothing to send
+
+# Default source address for WiFi clients
+SRC_WIFI = 0x0A
 
 
 class HeatMode(IntEnum):
     """Heat mode enumeration."""
-    READY = HEAT_MODE_READY
-    REST = HEAT_MODE_REST
-    READY_IN_REST = HEAT_MODE_READY_IN_REST
+    READY = 0
+    REST = 1
+    READY_IN_REST = 2
 
 
 class HeatState(IntEnum):
     """Heat state enumeration."""
-    OFF = HEAT_STATE_OFF
-    HEATING = HEAT_STATE_HEATING
-    HEAT_WAITING = HEAT_STATE_HEAT_WAITING
+    OFF = 0
+    HEATING = 1
+    HEAT_WAITING = 2
 
 
 class TempRange(IntEnum):
     """Temperature range enumeration."""
-    LOW = TEMP_RANGE_LOW
-    HIGH = TEMP_RANGE_HIGH
+    LOW = 0
+    HIGH = 1
 
 
 class PumpState(IntEnum):
@@ -76,134 +73,157 @@ class PumpState(IntEnum):
     HIGH = 2
 
 
+class ToggleItem(IntEnum):
+    """Toggle item codes."""
+    PUMP1 = 0x04
+    PUMP2 = 0x05
+    PUMP3 = 0x06
+    PUMP4 = 0x07
+    PUMP5 = 0x08
+    PUMP6 = 0x09
+    LIGHT1 = 0x11
+    LIGHT2 = 0x12
+    AUX1 = 0x16
+    AUX2 = 0x17
+    MISTER = 0x0E
+    BLOWER = 0x0C
+    HOLD = 0x3C
+    TEMP_RANGE = 0x50
+    HEAT_MODE = 0x51
+
+
 @dataclass
 class SpaStatus:
     """Current spa status data."""
     current_temp: float | None = None
     target_temp: float | None = None
-    temp_scale_celsius: bool = True
+    temp_scale_celsius: bool = False
     temp_range: TempRange = TempRange.HIGH
     heat_mode: HeatMode = HeatMode.READY
-    heat_state: HeatState = HeatState.OFF
-    pump1: PumpState = PumpState.OFF
-    pump2: PumpState = PumpState.OFF
-    pump3: PumpState = PumpState.OFF
-    pump4: PumpState = PumpState.OFF
-    pump5: PumpState = PumpState.OFF
-    pump6: PumpState = PumpState.OFF
+    heating: bool = False
+    pump1: int = 0
+    pump2: int = 0
+    pump3: int = 0
+    pump4: int = 0
+    pump5: int = 0
+    pump6: int = 0
     blower: int = 0
     light1: bool = False
     light2: bool = False
     mister: bool = False
+    aux1: bool = False
+    aux2: bool = False
     circ_pump: bool = False
-    filter_mode: int = 0
+    filter1_running: bool = False
+    filter2_running: bool = False
     hour: int = 0
     minute: int = 0
     clock_24hr: bool = True
     priming: bool = False
     hold_mode: bool = False
-    panel_locked: bool = False
-    model: str = ""
-    software_id: str = ""
 
 
 @dataclass
 class SpaConfig:
     """Spa configuration data."""
+    model: str = ""
+    software_id: str = ""
     pump_count: int = 2
-    pump1_speeds: int = 2
-    pump2_speeds: int = 2
-    pump3_speeds: int = 0
-    pump4_speeds: int = 0
-    pump5_speeds: int = 0
-    pump6_speeds: int = 0
+    pump_speeds: list[int] = field(default_factory=lambda: [2, 2, 0, 0, 0, 0])
     has_blower: bool = False
+    blower_speeds: int = 0
     has_mister: bool = False
     has_aux1: bool = False
     has_aux2: bool = False
-    has_circ_pump: bool = False
+    has_circ_pump: bool = True
     light_count: int = 1
 
 
-def calculate_crc8(data: bytes) -> int:
+def crc8_checksum(data: bytes) -> int:
     """Calculate CRC-8 checksum for Balboa protocol.
-
-    Polynomial: 0x07 | Initial: 0x02 | Final XOR: 0x02
-    This is the standard Balboa WiFi module CRC used by most controllers.
+    
+    Algorithm from balboa_worldwide_app Ruby implementation.
     """
-    crc = 0x02
+    crc = 0x02  # Initial value
     for byte in data:
-        crc ^= byte
-        for _ in range(8):
-            if crc & 0x80:
-                crc = ((crc << 1) ^ 0x07) & 0xFF
-            else:
-                crc = (crc << 1) & 0xFF
+        for i in range(8):
+            bit = crc & 0x80
+            crc = ((crc << 1) & 0xFF) | ((byte >> (7 - i)) & 0x01)
+            if bit:
+                crc ^= 0x07
+    # Final 8 iterations with no input
+    for _ in range(8):
+        bit = crc & 0x80
+        crc = (crc << 1) & 0xFF
+        if bit:
+            crc ^= 0x07
     return crc ^ 0x02
 
 
-def calculate_crc8_alt(data: bytes) -> int:
-    """Alternative CRC-8 calculation (simple XOR checksum).
+def build_message(src: int, msg_type_bytes: bytes, payload: bytes = b"") -> bytes:
+    """Build a Balboa protocol message.
     
-    Some older Balboa/Sundance controllers use a simpler checksum.
+    Args:
+        src: Source address (0x0A for WiFi)
+        msg_type_bytes: 2-byte message type (e.g., b'\\xAF\\x13')
+        payload: Message payload
     """
-    crc = 0
-    for byte in data:
-        crc ^= byte
-    return crc
+    # Content = src + msg_type (2 bytes) + payload
+    content = bytes([src]) + msg_type_bytes + payload
+    # Length = content + 2 (for length byte itself and checksum)
+    length = len(content) + 2
+    # Message without delimiters for CRC calculation
+    msg_body = bytes([length]) + content
+    crc = crc8_checksum(msg_body)
+    return bytes([MSG_START]) + msg_body + bytes([crc, MSG_END])
 
 
-def build_message(channel: int, msg_type: int, data: bytes = b"") -> bytes:
-    """Build a Balboa protocol message."""
-    flag = 0xAF if channel == CHANNEL_BROADCAST else 0xBF
-    content = bytes([channel, flag, msg_type]) + data
-    length = len(content) + 2  # +2 for length byte and checksum
-    crc = calculate_crc8(bytes([length]) + content)
-    return bytes([MSG_DELIMITER, length]) + content + bytes([crc, MSG_DELIMITER])
-
-
-def parse_message(data: bytes) -> tuple[int, int, bytes] | None:
+def parse_message(data: bytes) -> tuple[int, bytes, bytes] | None:
     """Parse a Balboa protocol message.
-
-    Returns: (channel, msg_type, payload) or None if invalid.
-    Tries both CRC algorithms for compatibility with different firmware.
+    
+    Returns: (src, msg_type_bytes, payload) or None if invalid.
     """
     if len(data) < 7:
         return None
-    if data[0] != MSG_DELIMITER or data[-1] != MSG_DELIMITER:
+    if data[0] != MSG_START or data[-1] != MSG_END:
         return None
-
+    
     length = data[1]
     if len(data) != length + 2:
+        _LOGGER.debug("Length mismatch: expected %d, got %d", length + 2, len(data))
         return None
-
-    # Try standard CRC first
-    expected_crc = calculate_crc8(data[1:-2])
-    if data[-2] != expected_crc:
-        # Try alternative CRC
-        expected_crc_alt = calculate_crc8_alt(data[1:-2])
-        if data[-2] != expected_crc_alt:
-            _LOGGER.debug(
-                "CRC mismatch: expected %02X or %02X, got %02X", 
-                expected_crc, expected_crc_alt, data[-2]
-            )
-            # For Sundance spas, sometimes we should accept the message anyway
-            # if it looks structurally valid (has correct delimiters and length)
-            if len(data) >= 7:
-                _LOGGER.debug("Accepting message despite CRC mismatch (Sundance compatibility)")
-            else:
-                return None
-
-    channel  = data[2]
-    # data[3] = flag byte (0xAF / 0xBF) – not used further
-    msg_type = data[4]
-    payload  = data[5:-2]
-    return channel, msg_type, payload
+    
+    # Verify checksum
+    expected_crc = crc8_checksum(data[1:-2])
+    actual_crc = data[-2]
+    if expected_crc != actual_crc:
+        _LOGGER.debug("CRC mismatch: expected %02X, got %02X", expected_crc, actual_crc)
+        # Accept anyway for compatibility - some firmware has different CRC
+    
+    src = data[2]
+    msg_type = data[3:5]  # 2 bytes
+    payload = data[5:-2]
+    return src, msg_type, payload
 
 
 class SpaClient:
-    """Client for communicating with Balboa spa via EW11 bridge."""
-
+    """Client for communicating with Balboa spa via EW11 TCP bridge."""
+    
+    # Message type constants as bytes
+    MT_STATUS = b'\xAF\x13'
+    MT_FILTER = b'\xAF\x23'
+    MT_INFO = b'\xAF\x24'
+    MT_SETTINGS = b'\xAF\x25'
+    MT_SETUP = b'\xAF\x26'
+    MT_CONFIG = b'\xAF\x2E'
+    MT_READY = b'\xAF\x14'
+    MT_NTS = b'\xAF\x06'
+    MT_CONFIG_REQ = b'\xBF\x04'  # 0xBF for requests
+    MT_TOGGLE = b'\xBF\x11'
+    MT_SET_TEMP = b'\xBF\x20'
+    MT_SET_TIME = b'\xBF\x21'
+    MT_SET_SCALE = b'\xBF\x27'
+    
     def __init__(self, host: str, port: int = 8899) -> None:
         """Initialize the spa client."""
         self._host = host
@@ -211,7 +231,6 @@ class SpaClient:
         self._reader: asyncio.StreamReader | None = None
         self._writer: asyncio.StreamWriter | None = None
         self._connected = False
-        self._channel: int | None = None
         self._status = SpaStatus()
         self._config = SpaConfig()
         self._config_loaded = False
@@ -219,137 +238,115 @@ class SpaClient:
         self._receive_task: asyncio.Task | None = None
         self._lock = asyncio.Lock()
         self._buffer = bytearray()
-        self._last_cts_time: float = 0
-        # FIX: Two separate events – one for channel assignment, one for config.
-        # Both must be cleared on every new connect() so reconnects work correctly.
-        self._channel_event = asyncio.Event()
+        self._message_queue: list[bytes] = []
         self._config_event = asyncio.Event()
-
-    # ------------------------------------------------------------------
-    # Properties
-    # ------------------------------------------------------------------
-
+        self._status_received = asyncio.Event()
+    
     @property
     def host(self) -> str:
         return self._host
-
+    
     @property
     def connected(self) -> bool:
         return self._connected
-
+    
     @property
     def status(self) -> SpaStatus:
         return self._status
-
+    
     @property
     def config(self) -> SpaConfig:
         return self._config
-
+    
     @property
     def model(self) -> str:
-        return self._status.model
-
+        return self._config.model
+    
     @property
     def temperature(self) -> float | None:
         return self._status.current_temp
-
+    
     @property
     def target_temperature(self) -> float | None:
         return self._status.target_temp
-
+    
     @property
     def temperature_unit_celsius(self) -> bool:
         return self._status.temp_scale_celsius
-
+    
     @property
     def temperature_minimum(self) -> float:
         if self._status.temp_scale_celsius:
-            return 10.0 if self._status.temp_range == TempRange.LOW else 26.5
+            return 10.0 if self._status.temp_range == TempRange.LOW else 26.0
         return 50.0 if self._status.temp_range == TempRange.LOW else 80.0
-
+    
     @property
     def temperature_maximum(self) -> float:
         if self._status.temp_scale_celsius:
             return 37.0 if self._status.temp_range == TempRange.LOW else 40.0
         return 99.0 if self._status.temp_range == TempRange.LOW else 104.0
-
+    
     @property
     def heat_mode(self) -> HeatMode:
         return self._status.heat_mode
-
+    
     @property
     def heat_state(self) -> HeatState:
-        return self._status.heat_state
-
-    # ------------------------------------------------------------------
-    # Callbacks
-    # ------------------------------------------------------------------
-
+        if self._status.heating:
+            return HeatState.HEATING
+        return HeatState.OFF
+    
     def add_update_callback(self, callback: Callable[[], None]) -> Callable[[], None]:
-        """Add a callback for status updates. Returns a removal function."""
+        """Add a callback for status updates."""
         self._update_callbacks.append(callback)
-
-        def remove_callback() -> None:
+        
+        def remove():
             if callback in self._update_callbacks:
                 self._update_callbacks.remove(callback)
-
-        return remove_callback
-
+        
+        return remove
+    
     def _notify_update(self) -> None:
-        """Notify all registered callbacks."""
-        for callback in self._update_callbacks:
+        """Notify all callbacks of status update."""
+        for cb in self._update_callbacks:
             try:
-                callback()
+                cb()
             except Exception as err:
-                _LOGGER.error("Error in update callback: %s", err)
-
-    # ------------------------------------------------------------------
-    # Connection management
-    # ------------------------------------------------------------------
-
+                _LOGGER.error("Callback error: %s", err)
+    
     async def connect(self) -> bool:
-        """Connect to the spa via EW11 bridge."""
+        """Connect to spa via EW11 bridge."""
         try:
             _LOGGER.info("Connecting to spa at %s:%d", self._host, self._port)
-
+            
             self._reader, self._writer = await asyncio.wait_for(
                 asyncio.open_connection(self._host, self._port),
                 timeout=10,
             )
-
+            
             self._connected = True
-            self._channel = None
             self._buffer.clear()
-
-            # FIX: Always clear both events so that a reconnect properly
-            # waits for channel assignment and config again from scratch.
-            self._channel_event.clear()
+            self._message_queue.clear()
             self._config_event.clear()
+            self._status_received.clear()
             self._config_loaded = False
-
+            
             self._receive_task = asyncio.create_task(self._receive_loop())
-
-            _LOGGER.info("Connected to spa at %s:%d", self._host, self._port)
             
-            # FIX: Proactively request channel assignment after connecting.
-            # Some Balboa controllers (especially older Sundance models) do not
-            # broadcast NEW_CLIENT_CTS automatically - we need to initiate.
-            await asyncio.sleep(0.5)  # Let the receive loop start
-            await self._request_channel()
-            
+            _LOGGER.info("Connected to spa")
             return True
-
+            
         except asyncio.TimeoutError:
             _LOGGER.error("Connection timeout to %s:%d", self._host, self._port)
             return False
         except Exception as err:
             _LOGGER.error("Connection error: %s", err)
             return False
-
+    
     async def disconnect(self) -> None:
-        """Disconnect from the spa."""
+        """Disconnect from spa."""
         self._connected = False
-
+        
         if self._receive_task:
             self._receive_task.cancel()
             try:
@@ -357,7 +354,7 @@ class SpaClient:
             except asyncio.CancelledError:
                 pass
             self._receive_task = None
-
+        
         if self._writer:
             try:
                 self._writer.close()
@@ -366,36 +363,76 @@ class SpaClient:
                 pass
             self._writer = None
             self._reader = None
-
+        
         _LOGGER.info("Disconnected from spa")
-
-    # ------------------------------------------------------------------
-    # Receive loop
-    # ------------------------------------------------------------------
-
+    
+    async def async_configuration_loaded(self, timeout: float = 30.0) -> bool:
+        """Wait for initial configuration to be loaded."""
+        try:
+            # First wait for any status message to confirm communication
+            await asyncio.wait_for(
+                self._status_received.wait(),
+                timeout=timeout
+            )
+            _LOGGER.info("Received first status message from spa")
+            
+            # Request configuration
+            await self._request_config(1)  # Control config
+            await asyncio.sleep(0.5)
+            await self._request_config(2)  # Panel config
+            await asyncio.sleep(0.5)
+            await self._request_config(3)  # Filter cycles
+            
+            # Wait for config response
+            try:
+                await asyncio.wait_for(
+                    self._config_event.wait(),
+                    timeout=10.0
+                )
+                _LOGGER.info("Configuration loaded successfully")
+            except asyncio.TimeoutError:
+                _LOGGER.warning("Config request timeout - using defaults for Sundance Cameo 880")
+                self._use_cameo_880_defaults()
+            
+            self._config_loaded = True
+            return True
+            
+        except asyncio.TimeoutError:
+            _LOGGER.error("Timeout waiting for spa status - check EW11 configuration")
+            return False
+    
+    def _use_cameo_880_defaults(self) -> None:
+        """Set default configuration for Sundance Cameo 880."""
+        self._config.model = "Sundance Cameo 880"
+        self._config.pump_count = 3
+        self._config.pump_speeds = [2, 2, 1, 0, 0, 0]  # 3 pumps
+        self._config.has_blower = False
+        self._config.has_circ_pump = True
+        self._config.light_count = 1
+        _LOGGER.info("Using Cameo 880 default configuration")
+    
     async def _receive_loop(self) -> None:
-        """Receive and process messages from the spa."""
+        """Receive and process messages."""
         while self._connected and self._reader:
             try:
                 data = await asyncio.wait_for(
                     self._reader.read(1024),
-                    timeout=30,
+                    timeout=60,
                 )
-
+                
                 if not data:
                     _LOGGER.warning("Connection closed by spa")
                     self._connected = False
                     self._notify_update()
                     break
-
+                
                 self._buffer.extend(data)
                 await self._process_buffer()
-
+                
             except asyncio.TimeoutError:
-                _LOGGER.warning("No data for 30 s – marking spa as disconnected")
-                self._connected = False
-                self._notify_update()
-                break
+                _LOGGER.debug("No data for 60s - connection may be idle")
+                # Don't disconnect - spa may just be idle
+                continue
             except asyncio.CancelledError:
                 break
             except Exception as err:
@@ -403,445 +440,334 @@ class SpaClient:
                 self._connected = False
                 self._notify_update()
                 break
-
+    
     async def _process_buffer(self) -> None:
-        """Extract and dispatch complete messages from the receive buffer."""
+        """Process received data buffer."""
         while True:
+            # Find start of message
             try:
-                start = self._buffer.index(MSG_DELIMITER)
+                start = self._buffer.index(MSG_START)
                 if start > 0:
+                    _LOGGER.debug("Discarding %d bytes before message start", start)
                     self._buffer = self._buffer[start:]
             except ValueError:
                 self._buffer.clear()
                 return
-
+            
+            # Need at least 2 bytes to get length
             if len(self._buffer) < 2:
                 return
-
-            msg_len = self._buffer[1] + 2  # +2: start delimiter + length byte
+            
+            length = self._buffer[1]
+            msg_len = length + 2  # +2 for start delimiter and length byte
+            
+            # Sanity check
+            if length < 5 or length >= 0x7E:
+                _LOGGER.debug("Invalid message length %d, skipping byte", length)
+                self._buffer = self._buffer[1:]
+                continue
+            
+            # Wait for complete message
             if len(self._buffer) < msg_len:
                 return
-
+            
+            # Check end delimiter
+            if self._buffer[msg_len - 1] != MSG_END:
+                _LOGGER.debug("Missing end delimiter at position %d", msg_len - 1)
+                self._buffer = self._buffer[1:]
+                continue
+            
+            # Extract and process message
             msg_data = bytes(self._buffer[:msg_len])
             self._buffer = self._buffer[msg_len:]
-
+            
             parsed = parse_message(msg_data)
             if parsed:
-                channel, msg_type, payload = parsed
-                await self._handle_message(channel, msg_type, payload)
+                src, msg_type, payload = parsed
+                await self._handle_message(src, msg_type, payload)
             else:
-                _LOGGER.debug("Invalid message discarded: %s", msg_data.hex())
-
-    # ------------------------------------------------------------------
-    # Message handler
-    # ------------------------------------------------------------------
-
-    async def _handle_message(self, channel: int, msg_type: int, payload: bytes) -> None:
-        """Dispatch a received message to the appropriate handler."""
-        _LOGGER.debug(
-            "Rx: channel=%02X type=%02X payload=%s",
-            channel, msg_type, payload.hex() if payload else "",
-        )
-
-        if msg_type == MSG_TYPE_STATUS_UPDATE:
-            self._parse_status_update(payload)
-            self._notify_update()
-
-        elif msg_type in (MSG_TYPE_CONFIG_RESP, MSG_TYPE_CONFIG_RESP_LEGACY):
-            # FIX: Older Balboa firmware (and some Sundance models) sends the
-            # configuration response as type 0x0C instead of 0x2E.  The original
-            # code only checked for 0x2E, so 0x0C responses were silently dropped
-            # and _config_event was never set -> permanent timeout.
-            _LOGGER.debug(
-                "Config response received (type %02X)", msg_type
-            )
-            self._parse_config_response(payload)
-            self._config_loaded = True
-            self._config_event.set()
-
-        elif msg_type == MSG_TYPE_INFO_RESP:
-            self._parse_info_response(payload)
-
-        elif msg_type == MSG_TYPE_NEW_CLIENT_CTS:
-            # The spa invites new RS485 devices to identify themselves.
-            # We must respond with a channel assignment request.
-            _LOGGER.debug("NEW_CLIENT_CTS - requesting channel assignment")
-            await self._request_channel()
-
-        elif msg_type == MSG_TYPE_CTS:
-            self._last_cts_time = asyncio.get_event_loop().time()
-            # If we don't have a channel yet, try requesting one on CTS
-            if self._channel is None:
-                _LOGGER.debug("CTS received without channel - requesting assignment")
-                await self._request_channel()
-
-        elif msg_type == MSG_TYPE_CHANNEL_ASSIGN_RESP:
-            if len(payload) >= 1:
-                self._channel = payload[0]
-                _LOGGER.info("Assigned channel: %02X", self._channel)
-                # FIX: Signal that channel assignment is complete so that
-                # async_configuration_loaded() can stop waiting and send
-                # the settings request with the correct source channel.
-                self._channel_event.set()
-                await self._send_channel_ack()
+                _LOGGER.debug("Failed to parse message: %s", msg_data.hex())
+    
+    async def _handle_message(self, src: int, msg_type: bytes, payload: bytes) -> None:
+        """Handle received message."""
+        _LOGGER.debug("Rx: src=%02X type=%s payload=%s", 
+                      src, msg_type.hex(), payload.hex() if payload else "")
         
-        elif msg_type == MSG_TYPE_NTS:
-            # Nothing-to-send from spa - spa is idle, good time to send commands
-            _LOGGER.debug("NTS received - spa bus is idle")
+        if msg_type == self.MT_STATUS:
+            self._parse_status(payload)
+            self._status_received.set()
+            self._notify_update()
+        
+        elif msg_type == self.MT_CONFIG:
+            self._parse_config(payload)
+            self._config_event.set()
+        
+        elif msg_type == self.MT_INFO:
+            self._parse_info(payload)
+        
+        elif msg_type == self.MT_FILTER:
+            self._parse_filter_cycles(payload)
+        
+        elif msg_type == self.MT_READY:
+            # Spa is ready to receive - send queued message
+            if self._message_queue:
+                msg = self._message_queue.pop(0)
+                await self._send_raw(msg)
+        
+        elif msg_type == self.MT_NTS:
+            # Nothing to send - spa is idle
+            pass
         
         else:
-            # Log unknown message types for debugging
-            _LOGGER.debug(
-                "Unhandled message type %02X on channel %02X: %s",
-                msg_type, channel, payload.hex() if payload else "(empty)"
-            )
-
-    # ------------------------------------------------------------------
-    # Channel assignment helpers
-    # ------------------------------------------------------------------
-
-    async def _request_channel(self) -> None:
-        """Send a Balboa RS485 channel assignment request.
-
-        Uses CHANNEL_MULTICAST (0xFE) as source because we have no
-        assigned channel yet.  Device type 0x0A = WiFi/network client.
-        
-        For some Balboa/Sundance controllers we also try sending a simple
-        "panel request" which is just the channel request broadcast to 0xFF.
-        """
-        if not self._connected or not self._writer:
-            return
-
-        # Standard channel assignment request
-        data = bytes([0x0A, 0x00, 0x00])  # [device_type, hash_hi, hash_lo]
-        message = build_message(CHANNEL_MULTICAST, MSG_TYPE_CHANNEL_ASSIGN_REQ, data)
-
-        async with self._lock:
-            try:
-                self._writer.write(message)
-                await self._writer.drain()
-                _LOGGER.debug("Sent channel assignment request: %s", message.hex())
-            except Exception as err:
-                _LOGGER.error("Error sending channel request: %s", err)
-                self._connected = False
-                return
-
-        # Also try broadcast channel request for older firmware
-        await asyncio.sleep(0.2)
-        message_broadcast = build_message(CHANNEL_BROADCAST, MSG_TYPE_CHANNEL_ASSIGN_REQ, data)
-        
-        async with self._lock:
-            try:
-                self._writer.write(message_broadcast)
-                await self._writer.drain()
-                _LOGGER.debug("Sent broadcast channel request: %s", message_broadcast.hex())
-            except Exception as err:
-                _LOGGER.error("Error sending broadcast channel request: %s", err)
-
-    async def _send_channel_ack(self) -> None:
-        """Acknowledge the channel assigned by the spa."""
-        if not self._connected or not self._writer or self._channel is None:
-            return
-
-        message = build_message(self._channel, MSG_TYPE_CHANNEL_ASSIGN_ACK, b"")
-
-        async with self._lock:
-            try:
-                self._writer.write(message)
-                await self._writer.drain()
-                _LOGGER.debug("Sent channel ACK for channel %02X", self._channel)
-            except Exception as err:
-                _LOGGER.error("Error sending channel ACK: %s", err)
-                self._connected = False
-
-    # ------------------------------------------------------------------
-    # Message parsers
-    # ------------------------------------------------------------------
-
-    def _parse_status_update(self, payload: bytes) -> None:
-        """Parse status update message (type 0x13)."""
+            _LOGGER.debug("Unknown message type: %s", msg_type.hex())
+    
+    def _parse_status(self, payload: bytes) -> None:
+        """Parse status message (0xAF 0x13)."""
         if len(payload) < 20:
-            _LOGGER.debug("Status update too short: %d bytes", len(payload))
+            _LOGGER.warning("Status message too short: %d bytes", len(payload))
             return
-
-        self._status.hold_mode = payload[0] == 0x05
-        self._status.priming   = payload[1] == 0x01
-
+        
+        # Byte 0: flags (hold mode)
+        self._status.hold_mode = (payload[0] & 0x05) != 0
+        
+        # Byte 1: priming flag
+        self._status.priming = payload[1] == 0x01
+        
+        # Byte 2: current temperature (0xFF = unknown)
         if payload[2] != 0xFF:
-            self._status.current_temp = (
-                payload[2] / 2.0 if self._status.temp_scale_celsius else float(payload[2])
-            )
+            temp = payload[2]
+            if self._status.temp_scale_celsius:
+                self._status.current_temp = temp / 2.0
+            else:
+                self._status.current_temp = float(temp)
         else:
             self._status.current_temp = None
-
-        self._status.hour   = payload[3]
+        
+        # Byte 3-4: hour and minute
+        self._status.hour = payload[3]
         self._status.minute = payload[4]
-
-        # Byte 5: flags – heat mode in bits 0-1 only
-        heat_mode_raw = payload[5] & 0x03
-        if heat_mode_raw in (0, 1, 3):
-            self._status.heat_mode = HeatMode(heat_mode_raw)
-
+        
+        # Byte 5: heat mode (bits 0-1)
+        heat_mode = payload[5] & 0x03
+        if heat_mode == 0:
+            self._status.heat_mode = HeatMode.READY
+        elif heat_mode == 1:
+            self._status.heat_mode = HeatMode.REST
+        elif heat_mode == 2:
+            self._status.heat_mode = HeatMode.READY_IN_REST
+        
         # Byte 9: misc flags
         flags9 = payload[9]
-        self._status.temp_scale_celsius = bool(flags9 & 0x01)
-        self._status.clock_24hr         = bool(flags9 & 0x02)
-        self._status.filter_mode        = (flags9 >> 3) & 0x03
-        self._status.panel_locked       = bool(flags9 & 0x20)
-
-        # Byte 10: heating flags
+        self._status.temp_scale_celsius = (flags9 & 0x01) != 0
+        self._status.clock_24hr = (flags9 & 0x02) != 0
+        self._status.filter1_running = (flags9 & 0x04) != 0
+        self._status.filter2_running = (flags9 & 0x08) != 0
+        
+        # Byte 10: heat state and temp range
         flags10 = payload[10]
+        self._status.heating = (flags10 & 0x30) != 0
         self._status.temp_range = TempRange.HIGH if (flags10 & 0x04) else TempRange.LOW
-        heat_state_val = (flags10 >> 4) & 0x03
-        if heat_state_val in (0, 1, 2):
-            self._status.heat_state = HeatState(heat_state_val)
-
-        # Byte 11: pumps 1-4 (2 bits each)
-        f11 = payload[11]
-        self._status.pump1 = PumpState(min(f11 & 0x03,        2))
-        self._status.pump2 = PumpState(min((f11 >> 2) & 0x03, 2))
-        self._status.pump3 = PumpState(min((f11 >> 4) & 0x03, 2))
-        self._status.pump4 = PumpState(min((f11 >> 6) & 0x03, 2))
-
+        
+        # Byte 11: pumps 1-4
+        flags11 = payload[11]
+        self._status.pump1 = flags11 & 0x03
+        self._status.pump2 = (flags11 >> 2) & 0x03
+        self._status.pump3 = (flags11 >> 4) & 0x03
+        self._status.pump4 = (flags11 >> 6) & 0x03
+        
         # Byte 12: pumps 5-6
-        f12 = payload[12]
-        self._status.pump5 = PumpState(min(f12 & 0x03,        2))
-        self._status.pump6 = PumpState(min((f12 >> 2) & 0x03, 2))
-
-        # Byte 13: circ pump + blower
-        f13 = payload[13]
-        self._status.circ_pump = bool(f13 & 0x02)
-        self._status.blower    = (f13 >> 2) & 0x03
-
+        flags12 = payload[12]
+        self._status.pump5 = flags12 & 0x03
+        self._status.pump6 = (flags12 >> 2) & 0x03
+        
+        # Byte 13: circ pump and blower
+        flags13 = payload[13]
+        self._status.circ_pump = (flags13 & 0x02) != 0
+        self._status.blower = (flags13 >> 2) & 0x03
+        
         # Byte 14: lights
-        f14 = payload[14]
-        self._status.light1 = bool(f14 & 0x03)
-        self._status.light2 = bool((f14 >> 2) & 0x03)
-
-        # Byte 15: mister
-        self._status.mister = bool(payload[15])
-
+        flags14 = payload[14]
+        self._status.light1 = (flags14 & 0x03) != 0
+        self._status.light2 = ((flags14 >> 2) & 0x03) != 0
+        
+        # Byte 15: mister and aux
+        flags15 = payload[15]
+        self._status.mister = (flags15 & 0x01) != 0
+        self._status.aux1 = (flags15 & 0x08) != 0
+        self._status.aux2 = (flags15 & 0x10) != 0
+        
         # Byte 20: target temperature
         if len(payload) > 20:
-            self._status.target_temp = (
-                payload[20] / 2.0 if self._status.temp_scale_celsius else float(payload[20])
-            )
-
+            target = payload[20]
+            if self._status.temp_scale_celsius:
+                self._status.target_temp = target / 2.0
+            else:
+                self._status.target_temp = float(target)
+        
         _LOGGER.debug(
-            "Status: temp=%.1f target=%.1f heat_mode=%s heat_state=%s "
-            "pump1=%s pump2=%s light1=%s",
-            self._status.current_temp or 0,
-            self._status.target_temp or 0,
-            self._status.heat_mode.name,
-            self._status.heat_state.name,
-            self._status.pump1.name,
-            self._status.pump2.name,
-            self._status.light1,
+            "Status: temp=%s target=%s heating=%s pumps=[%d,%d,%d] lights=[%s,%s]",
+            self._status.current_temp,
+            self._status.target_temp,
+            self._status.heating,
+            self._status.pump1, self._status.pump2, self._status.pump3,
+            self._status.light1, self._status.light2
         )
-
-    def _parse_config_response(self, payload: bytes) -> None:
-        """Parse configuration response (type 0x0C or 0x2E).
-
-        Byte 0 – 2 bits per pump slot:
-          bits 0-1 = pump 1  (0=none, 1=1-speed, 2=2-speed)
-          bits 2-3 = pump 2
-          bits 4-5 = pump 3
-          bits 6-7 = pump 4
-        Byte 1 – pump 5 (bits 0-1) + pump 6 (bits 2-3)
-        Byte 2 – feature flags: bit0=circ, bit1=blower, bit2=mister
-        Byte 3 – light count (bits 0-1)
-        """
-        if len(payload) < 4:
-            _LOGGER.debug("Config response too short (%d bytes) – skipping", len(payload))
+    
+    def _parse_config(self, payload: bytes) -> None:
+        """Parse configuration message (0xAF 0x2E)."""
+        if len(payload) < 5:
             return
-
-        b0 = payload[0]
-        self._config.pump1_speeds = b0 & 0x03
-        self._config.pump2_speeds = (b0 >> 2) & 0x03
-        self._config.pump3_speeds = (b0 >> 4) & 0x03
-        self._config.pump4_speeds = (b0 >> 6) & 0x03
-
-        if len(payload) > 1:
-            b1 = payload[1]
-            self._config.pump5_speeds = b1 & 0x03
-            self._config.pump6_speeds = (b1 >> 2) & 0x03
-
-        self._config.pump_count = sum(
-            1 for s in (
-                self._config.pump1_speeds,
-                self._config.pump2_speeds,
-                self._config.pump3_speeds,
-                self._config.pump4_speeds,
-                self._config.pump5_speeds,
-                self._config.pump6_speeds,
-            ) if s > 0
-        )
-
-        if len(payload) > 2:
-            feat = payload[2]
-            self._config.has_circ_pump = bool(feat & 0x01)
-            self._config.has_blower    = bool(feat & 0x02)
-            self._config.has_mister    = bool(feat & 0x04)
-
-        if len(payload) > 3:
-            self._config.light_count = max(1, payload[3] & 0x03)
-
-        _LOGGER.debug(
-            "Config: pump1=%d pump2=%d pump3=%d speeds, "
-            "circ=%s blower=%s lights=%d",
-            self._config.pump1_speeds,
-            self._config.pump2_speeds,
-            self._config.pump3_speeds,
-            self._config.has_circ_pump,
-            self._config.has_blower,
-            self._config.light_count,
-        )
-
-    def _parse_info_response(self, payload: bytes) -> None:
-        """Parse information response message (type 0x24)."""
-        if len(payload) < 20:
-            return
-
-        ssid      = struct.unpack(">I", payload[0:4])[0]
-        model_num = (ssid >> 16) & 0xFFFF
-        version   = ssid & 0xFFFF
-        self._status.software_id = f"M{model_num} V{version // 100}.{version % 100}"
-
-        try:
-            self._status.model = payload[4:12].decode("ascii").strip("\x00").strip()
-        except Exception:
-            self._status.model = "Unknown"
-
-        _LOGGER.info("Spa model: %s, Software: %s",
-                     self._status.model, self._status.software_id)
-
-    def _apply_cameo880_defaults(self) -> None:
-        """Apply known Sundance Cameo 880 configuration as fallback.
-
-        Called when the spa does not respond to settings requests.
-        Cameo 880: 2×2-speed jets, 1 circ pump, 1 light, no blower.
-        """
-        _LOGGER.info(
-            "Applying Sundance Cameo 880 default configuration"
-        )
-        self._config.pump_count   = 2
-        self._config.pump1_speeds = 2  # 2-speed jet pump
-        self._config.pump2_speeds = 2  # 2-speed jet pump
-        self._config.pump3_speeds = 0
-        self._config.pump4_speeds = 0
-        self._config.pump5_speeds = 0
-        self._config.pump6_speeds = 0
-        self._config.has_circ_pump = True
-        self._config.has_blower    = False
-        self._config.has_mister    = False
-        self._config.light_count   = 1
-
-    # ------------------------------------------------------------------
-    # Send helpers
-    # ------------------------------------------------------------------
-
-    async def _send_message(self, msg_type: int, data: bytes = b"") -> None:
-        """Send a message to the spa using our assigned channel."""
+        
+        _LOGGER.debug("Parsing config: %s", payload.hex())
+        
+        # Pump configuration is in various bytes
+        # This varies by model - using simplified parsing
+        if len(payload) >= 6:
+            pump_info = payload[4]
+            self._config.pump_speeds[0] = pump_info & 0x03
+            self._config.pump_speeds[1] = (pump_info >> 2) & 0x03
+            self._config.pump_speeds[2] = (pump_info >> 4) & 0x03
+            self._config.pump_speeds[3] = (pump_info >> 6) & 0x03
+            
+            # Count pumps
+            self._config.pump_count = sum(1 for s in self._config.pump_speeds if s > 0)
+        
+        if len(payload) >= 7:
+            misc = payload[5]
+            self._config.has_circ_pump = (misc & 0x02) != 0
+            self._config.has_blower = (misc & 0x0C) != 0
+            self._config.blower_speeds = (misc >> 2) & 0x03
+        
+        if len(payload) >= 8:
+            light_info = payload[6]
+            self._config.light_count = 1 if (light_info & 0x03) else 0
+            if light_info & 0x0C:
+                self._config.light_count = 2
+        
+        _LOGGER.info("Config: pumps=%d speeds=%s circ=%s blower=%s lights=%d",
+                     self._config.pump_count, self._config.pump_speeds,
+                     self._config.has_circ_pump, self._config.has_blower,
+                     self._config.light_count)
+    
+    def _parse_info(self, payload: bytes) -> None:
+        """Parse system info message (0xAF 0x24)."""
+        if len(payload) >= 3:
+            # Model info is encoded in these bytes
+            model_bytes = payload[:3]
+            self._config.model = f"M{model_bytes[0]:d}_V{model_bytes[1]:d}.{model_bytes[2]:d}"
+            _LOGGER.info("Spa model: %s", self._config.model)
+    
+    def _parse_filter_cycles(self, payload: bytes) -> None:
+        """Parse filter cycles message (0xAF 0x23)."""
+        _LOGGER.debug("Filter cycles: %s", payload.hex())
+    
+    async def _send_raw(self, data: bytes) -> bool:
+        """Send raw data to spa."""
         if not self._connected or not self._writer:
-            _LOGGER.warning("Cannot send: not connected")
-            return
-
-        channel = self._channel if self._channel is not None else CHANNEL_WIFI
-        message = build_message(channel, msg_type, data)
-
+            return False
+        
         async with self._lock:
             try:
-                self._writer.write(message)
+                _LOGGER.debug("Tx: %s", data.hex())
+                self._writer.write(data)
                 await self._writer.drain()
-                _LOGGER.debug("Tx type=%02X: %s", msg_type, message.hex())
+                return True
             except Exception as err:
                 _LOGGER.error("Send error: %s", err)
                 self._connected = False
-
-    async def request_configuration(self) -> None:
-        """Request spa configuration (pump layout, features)."""
-        await self._send_message(
-            MSG_TYPE_SETTINGS_REQ, bytes([SETTINGS_CONFIG, 0x00, 0x00])
-        )
-
-    async def request_info(self) -> None:
-        """Request spa information (model, software version)."""
-        await self._send_message(
-            MSG_TYPE_SETTINGS_REQ, bytes([SETTINGS_INFO, 0x00, 0x00])
-        )
-
-    async def async_configuration_loaded(self) -> None:
-        """Wait for channel assignment, then request and await configuration."""
-        # FIX: Wait for channel assignment BEFORE sending the config request.
-        # Previously the request was sent immediately after TCP connect, while
-        # the channel handshake was still in progress.  The spa ignores settings
-        # requests from an unrecognised source channel, so _config_event never
-        # fired and the 10-second timeout always expired.
-        try:
-            await asyncio.wait_for(self._channel_event.wait(), timeout=5)
-            _LOGGER.debug("Channel assigned (%02X) – sending configuration request",
-                          self._channel)
-        except asyncio.TimeoutError:
-            _LOGGER.warning(
-                "Channel not assigned within 5 s – sending config request anyway"
-            )
-
-        await self.request_configuration()
-        await asyncio.sleep(0.5)
-        await self.request_info()
-
-        try:
-            await asyncio.wait_for(self._config_event.wait(), timeout=15)
-        except asyncio.TimeoutError:
-            _LOGGER.warning(
-                "No configuration response received – using Cameo 880 defaults"
-            )
-            self._apply_cameo880_defaults()
-            self._config_loaded = True
-
-    # ------------------------------------------------------------------
-    # Control commands
-    # ------------------------------------------------------------------
-
-    async def set_temperature(self, temperature: float) -> None:
-        """Set target temperature."""
-        temp_byte = (
-            int(temperature * 2) if self._status.temp_scale_celsius else int(temperature)
-        )
-        await self._send_message(MSG_TYPE_SET_TEMP, bytes([temp_byte]))
-
+                return False
+    
+    async def _send_message(self, msg_type: bytes, payload: bytes = b"") -> bool:
+        """Queue a message to send (will be sent on next Ready)."""
+        msg = build_message(SRC_WIFI, msg_type, payload)
+        
+        # For immediate sending (most commands work this way with EW11)
+        return await self._send_raw(msg)
+    
+    async def _request_config(self, config_type: int) -> None:
+        """Request configuration from spa."""
+        # Config request: type byte as payload
+        payload = bytes([config_type, 0x00, 0x00])
+        await self._send_message(self.MT_CONFIG_REQ, payload)
+        _LOGGER.debug("Requested config type %d", config_type)
+    
     async def toggle_pump(self, pump_num: int) -> None:
-        """Toggle a pump (cycles off → low → high → off)."""
-        pump_items = {1: ITEM_PUMP_1, 2: ITEM_PUMP_2, 3: ITEM_PUMP_3}
-        if pump_num in pump_items:
-            await self._send_message(
-                MSG_TYPE_TOGGLE_ITEM, bytes([pump_items[pump_num], 0x00])
-            )
-
-    async def toggle_light(self, light_num: int = 1) -> None:
-        """Toggle lights."""
-        light_items = {1: ITEM_LIGHT_1, 2: ITEM_LIGHT_2}
-        if light_num in light_items:
-            await self._send_message(
-                MSG_TYPE_TOGGLE_ITEM, bytes([light_items[light_num], 0x00])
-            )
-
+        """Toggle a pump (1-6)."""
+        if pump_num < 1 or pump_num > 6:
+            return
+        item = ToggleItem.PUMP1 + (pump_num - 1)
+        await self._send_message(self.MT_TOGGLE, bytes([item, 0x00]))
+        _LOGGER.debug("Toggled pump %d", pump_num)
+    
+    async def toggle_light(self, light_num: int) -> None:
+        """Toggle a light (1-2)."""
+        if light_num < 1 or light_num > 2:
+            return
+        item = ToggleItem.LIGHT1 if light_num == 1 else ToggleItem.LIGHT2
+        await self._send_message(self.MT_TOGGLE, bytes([item, 0x00]))
+        _LOGGER.debug("Toggled light %d", light_num)
+    
     async def toggle_blower(self) -> None:
-        """Toggle blower."""
-        await self._send_message(MSG_TYPE_TOGGLE_ITEM, bytes([ITEM_BLOWER, 0x00]))
-
+        """Toggle the blower."""
+        await self._send_message(self.MT_TOGGLE, bytes([ToggleItem.BLOWER, 0x00]))
+        _LOGGER.debug("Toggled blower")
+    
+    async def toggle_mister(self) -> None:
+        """Toggle the mister."""
+        await self._send_message(self.MT_TOGGLE, bytes([ToggleItem.MISTER, 0x00]))
+        _LOGGER.debug("Toggled mister")
+    
     async def toggle_heat_mode(self) -> None:
-        """Toggle heat mode between Ready and Rest."""
-        await self._send_message(MSG_TYPE_TOGGLE_ITEM, bytes([ITEM_HEAT_MODE, 0x00]))
-
+        """Toggle heat mode (ready/rest)."""
+        await self._send_message(self.MT_TOGGLE, bytes([ToggleItem.HEAT_MODE, 0x00]))
+        _LOGGER.debug("Toggled heat mode")
+    
     async def toggle_temp_range(self) -> None:
-        """Toggle temperature range between Low and High."""
-        await self._send_message(MSG_TYPE_TOGGLE_ITEM, bytes([ITEM_TEMP_RANGE, 0x00]))
-
-    async def set_heat_mode(self, mode: HeatMode) -> None:
-        """Set heat mode, toggling until the desired mode is reached."""
-        if self._status.heat_mode != mode:
-            await self.toggle_heat_mode()
-            await asyncio.sleep(0.5)
-            if self._status.heat_mode != mode and mode == HeatMode.READY_IN_REST:
-                await self.toggle_heat_mode()
+        """Toggle temperature range (high/low)."""
+        await self._send_message(self.MT_TOGGLE, bytes([ToggleItem.TEMP_RANGE, 0x00]))
+        _LOGGER.debug("Toggled temp range")
+    
+    async def set_target_temperature(self, temp: float) -> None:
+        """Set target temperature."""
+        # Convert to wire format
+        if self._status.temp_scale_celsius:
+            wire_temp = int(temp * 2)
+        else:
+            wire_temp = int(temp)
+        
+        # Clamp to valid range
+        wire_temp = max(0, min(255, wire_temp))
+        
+        await self._send_message(self.MT_SET_TEMP, bytes([wire_temp]))
+        _LOGGER.debug("Set target temp to %s (wire: %d)", temp, wire_temp)
+    
+    async def set_time(self, hour: int, minute: int, is_24h: bool = True) -> None:
+        """Set spa time."""
+        flags = 0x80 if is_24h else 0x00
+        await self._send_message(self.MT_SET_TIME, bytes([flags | hour, minute]))
+        _LOGGER.debug("Set time to %02d:%02d", hour, minute)
+    
+    async def set_pump(self, pump_num: int, speed: int) -> None:
+        """Set pump to specific speed (cycles through speeds)."""
+        if pump_num < 1 or pump_num > 6:
+            return
+        
+        current = getattr(self._status, f"pump{pump_num}", 0)
+        max_speed = self._config.pump_speeds[pump_num - 1]
+        
+        if max_speed == 0:
+            return
+        
+        # Calculate toggles needed to reach desired speed
+        toggles = (speed - current) % (max_speed + 1)
+        
+        for i in range(toggles):
+            await self.toggle_pump(pump_num)
+            if i < toggles - 1:
+                await asyncio.sleep(0.2)
+    
+    async def set_light(self, light_num: int, on: bool) -> None:
+        """Set light state."""
+        current = getattr(self._status, f"light{light_num}", False)
+        if current != on:
+            await self.toggle_light(light_num)
