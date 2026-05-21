@@ -65,4 +65,5 @@ class SundanceTargetTempNumber(SundanceEntity, NumberEntity):
 
     async def async_set_native_value(self, value: float) -> None:
         """Set the target temperature."""
+        # set_temperature() ist ein Alias für set_target_temperature() in spa_client.py
         await self._spa.set_temperature(value)
