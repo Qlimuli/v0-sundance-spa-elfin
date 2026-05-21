@@ -24,13 +24,13 @@ async def async_setup_entry(
 ) -> None:
     """Set up binary sensor entities."""
     spa = entry.runtime_data
-    
+
     entities = [
         SundanceHeatingSensor(spa, entry.entry_id),
         SundanceCircPumpSensor(spa, entry.entry_id),
         SundanceFilteringSensor(spa, entry.entry_id),
     ]
-    
+
     async_add_entities(entities)
 
 
@@ -88,14 +88,23 @@ class SundanceFilteringSensor(SundanceEntity, BinarySensorEntity):
 
     @property
     def is_on(self) -> bool:
-        """Return true if filter cycle is active."""
-        return self._spa.status.filter_mode > 0
+        """Return true if any filter cycle is active."""
+        # FIX: SpaStatus hat filter1_running und filter2_running (bool),
+        #      kein filter_mode (int)
+        return self._spa.status.filter1_running or self._spa.status.filter2_running
 
     @property
     def extra_state_attributes(self) -> dict:
         """Return extra state attributes."""
-        filter_mode = self._spa.status.filter_mode
-        mode_names = {0: "Off", 1: "Cycle 1", 2: "Cycle 2", 3: "Cycle 1 & 2"}
-        return {
-            "filter_mode": mode_names.get(filter_mode, f"Unknown ({filter_mode})")
-        }
+        # FIX: filter1_running / filter2_running verwenden
+        f1 = self._spa.status.filter1_running
+        f2 = self._spa.status.filter2_running
+        if f1 and f2:
+            mode_str = "Cycle 1 & 2"
+        elif f1:
+            mode_str = "Cycle 1"
+        elif f2:
+            mode_str = "Cycle 2"
+        else:
+            mode_str = "Off"
+        return {"filter_mode": mode_str}
