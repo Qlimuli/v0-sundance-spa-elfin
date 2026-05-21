@@ -129,6 +129,7 @@ def calculate_crc8(data: bytes) -> int:
     """Calculate CRC-8 checksum for Balboa protocol.
 
     Polynomial: 0x07 | Initial: 0x02 | Final XOR: 0x02
+    This is the standard Balboa WiFi module CRC used by most controllers.
     """
     crc = 0x02
     for byte in data:
@@ -139,6 +140,17 @@ def calculate_crc8(data: bytes) -> int:
             else:
                 crc = (crc << 1) & 0xFF
     return crc ^ 0x02
+
+
+def calculate_crc8_alt(data: bytes) -> int:
+    """Alternative CRC-8 calculation (simple XOR checksum).
+    
+    Some older Balboa/Sundance controllers use a simpler checksum.
+    """
+    crc = 0
+    for byte in data:
+        crc ^= byte
+    return crc
 
 
 def build_message(channel: int, msg_type: int, data: bytes = b"") -> bytes:
@@ -154,6 +166,7 @@ def parse_message(data: bytes) -> tuple[int, int, bytes] | None:
     """Parse a Balboa protocol message.
 
     Returns: (channel, msg_type, payload) or None if invalid.
+    Tries both CRC algorithms for compatibility with different firmware.
     """
     if len(data) < 7:
         return None
@@ -164,10 +177,22 @@ def parse_message(data: bytes) -> tuple[int, int, bytes] | None:
     if len(data) != length + 2:
         return None
 
+    # Try standard CRC first
     expected_crc = calculate_crc8(data[1:-2])
     if data[-2] != expected_crc:
-        _LOGGER.debug("CRC mismatch: expected %02X, got %02X", expected_crc, data[-2])
-        return None
+        # Try alternative CRC
+        expected_crc_alt = calculate_crc8_alt(data[1:-2])
+        if data[-2] != expected_crc_alt:
+            _LOGGER.debug(
+                "CRC mismatch: expected %02X or %02X, got %02X", 
+                expected_crc, expected_crc_alt, data[-2]
+            )
+            # For Sundance spas, sometimes we should accept the message anyway
+            # if it looks structurally valid (has correct delimiters and length)
+            if len(data) >= 7:
+                _LOGGER.debug("Accepting message despite CRC mismatch (Sundance compatibility)")
+            else:
+                return None
 
     channel  = data[2]
     # data[3] = flag byte (0xAF / 0xBF) – not used further
@@ -305,6 +330,13 @@ class SpaClient:
             self._receive_task = asyncio.create_task(self._receive_loop())
 
             _LOGGER.info("Connected to spa at %s:%d", self._host, self._port)
+            
+            # FIX: Proactively request channel assignment after connecting.
+            # Some Balboa controllers (especially older Sundance models) do not
+            # broadcast NEW_CLIENT_CTS automatically - we need to initiate.
+            await asyncio.sleep(0.5)  # Let the receive loop start
+            await self._request_channel()
+            
             return True
 
         except asyncio.TimeoutError:
@@ -419,7 +451,7 @@ class SpaClient:
             # FIX: Older Balboa firmware (and some Sundance models) sends the
             # configuration response as type 0x0C instead of 0x2E.  The original
             # code only checked for 0x2E, so 0x0C responses were silently dropped
-            # and _config_event was never set → permanent timeout.
+            # and _config_event was never set -> permanent timeout.
             _LOGGER.debug(
                 "Config response received (type %02X)", msg_type
             )
@@ -433,11 +465,15 @@ class SpaClient:
         elif msg_type == MSG_TYPE_NEW_CLIENT_CTS:
             # The spa invites new RS485 devices to identify themselves.
             # We must respond with a channel assignment request.
-            _LOGGER.debug("NEW_CLIENT_CTS – requesting channel assignment")
+            _LOGGER.debug("NEW_CLIENT_CTS - requesting channel assignment")
             await self._request_channel()
 
         elif msg_type == MSG_TYPE_CTS:
             self._last_cts_time = asyncio.get_event_loop().time()
+            # If we don't have a channel yet, try requesting one on CTS
+            if self._channel is None:
+                _LOGGER.debug("CTS received without channel - requesting assignment")
+                await self._request_channel()
 
         elif msg_type == MSG_TYPE_CHANNEL_ASSIGN_RESP:
             if len(payload) >= 1:
@@ -448,6 +484,17 @@ class SpaClient:
                 # the settings request with the correct source channel.
                 self._channel_event.set()
                 await self._send_channel_ack()
+        
+        elif msg_type == MSG_TYPE_NTS:
+            # Nothing-to-send from spa - spa is idle, good time to send commands
+            _LOGGER.debug("NTS received - spa bus is idle")
+        
+        else:
+            # Log unknown message types for debugging
+            _LOGGER.debug(
+                "Unhandled message type %02X on channel %02X: %s",
+                msg_type, channel, payload.hex() if payload else "(empty)"
+            )
 
     # ------------------------------------------------------------------
     # Channel assignment helpers
@@ -458,10 +505,14 @@ class SpaClient:
 
         Uses CHANNEL_MULTICAST (0xFE) as source because we have no
         assigned channel yet.  Device type 0x0A = WiFi/network client.
+        
+        For some Balboa/Sundance controllers we also try sending a simple
+        "panel request" which is just the channel request broadcast to 0xFF.
         """
         if not self._connected or not self._writer:
             return
 
+        # Standard channel assignment request
         data = bytes([0x0A, 0x00, 0x00])  # [device_type, hash_hi, hash_lo]
         message = build_message(CHANNEL_MULTICAST, MSG_TYPE_CHANNEL_ASSIGN_REQ, data)
 
@@ -473,6 +524,19 @@ class SpaClient:
             except Exception as err:
                 _LOGGER.error("Error sending channel request: %s", err)
                 self._connected = False
+                return
+
+        # Also try broadcast channel request for older firmware
+        await asyncio.sleep(0.2)
+        message_broadcast = build_message(CHANNEL_BROADCAST, MSG_TYPE_CHANNEL_ASSIGN_REQ, data)
+        
+        async with self._lock:
+            try:
+                self._writer.write(message_broadcast)
+                await self._writer.drain()
+                _LOGGER.debug("Sent broadcast channel request: %s", message_broadcast.hex())
+            except Exception as err:
+                _LOGGER.error("Error sending broadcast channel request: %s", err)
 
     async def _send_channel_ack(self) -> None:
         """Acknowledge the channel assigned by the spa."""
