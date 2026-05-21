@@ -32,24 +32,44 @@ async def async_setup_entry(hass: HomeAssistant, entry: SundanceConfigEntry) -> 
     port = entry.data.get(CONF_PORT, DEFAULT_PORT)
 
     _LOGGER.info("Connecting to Sundance Spa at %s:%s", host, port)
-
     spa = SpaClient(host, port)
 
     try:
         if not await spa.connect():
             raise ConfigEntryNotReady(f"Unable to connect to spa at {host}:{port}")
 
-        # Wait for configuration with timeout – continue even if it fails
+        # FIX: Kein doppeltes wait_for mehr.
+        #      async_configuration_loaded() verwaltet seinen eigenen 30s-Timeout intern.
+        #      Wir geben ihm hier 35s als äußere Absicherung.
+        config_ok = False
         try:
-            await asyncio.wait_for(spa.async_configuration_loaded(), timeout=30)
-            _LOGGER.info("Spa configuration loaded successfully")
+            config_ok = await asyncio.wait_for(
+                spa.async_configuration_loaded(),
+                timeout=35,
+            )
         except asyncio.TimeoutError:
             _LOGGER.warning(
-                "Timeout waiting for spa configuration – continuing with limited features"
+                "Outer timeout waiting for spa configuration – continuing with defaults"
+            )
+            # Defaults setzen damit Entities nicht dauerhaft "Unbekannt" bleiben
+            spa._use_cameo_880_defaults()  # noqa: SLF001
+
+        if not config_ok:
+            # Erster Status-Frame kam gar nicht – EW11 wahrscheinlich falsch konfiguriert
+            _LOGGER.error(
+                "No status frame received from spa – "
+                "check EW11 is in TCP Server mode (not Modbus)"
+            )
+            await spa.disconnect()
+            raise ConfigEntryNotReady(
+                f"No data received from spa at {host}:{port}. "
+                "Ensure EW11 is configured as TCP Server on port 8899."
             )
 
+    except ConfigEntryNotReady:
+        raise
     except Exception as err:
-        _LOGGER.error("Error connecting to spa: %s", err)
+        _LOGGER.error("Error setting up spa: %s", err)
         await spa.disconnect()
         raise ConfigEntryNotReady from err
 
@@ -57,9 +77,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: SundanceConfigEntry) -> 
 
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
 
-    # BUG FIX #8: Reconnect-Task starten.
-    # Ohne diesen Task bleibt die Integration dauerhaft getrennt wenn der
-    # EW11 neu startet oder das Netzwerk kurz ausfällt.
+    # Reconnect-Loop im Hintergrund
     entry.async_create_background_task(
         hass,
         _reconnect_loop(hass, entry, spa),
@@ -74,26 +92,28 @@ async def _reconnect_loop(
     entry: SundanceConfigEntry,
     spa: SpaClient,
 ) -> None:
-    """Keep the spa connection alive by reconnecting when it drops."""
+    """Verbindung bei Ausfall automatisch wiederherstellen."""
     while True:
         await asyncio.sleep(RECONNECT_INTERVAL)
 
         if spa.connected:
             continue
 
-        _LOGGER.info("Spa disconnected – attempting reconnect to %s", spa.host)
+        _LOGGER.info("Spa disconnected – reconnecting to %s …", spa.host)
         try:
             if await spa.connect():
-                _LOGGER.info("Reconnected to spa at %s", spa.host)
+                _LOGGER.info("Reconnected to %s", spa.host)
                 try:
                     await asyncio.wait_for(
-                        spa.async_configuration_loaded(), timeout=30
+                        spa.async_configuration_loaded(),
+                        timeout=35,
                     )
                 except asyncio.TimeoutError:
-                    _LOGGER.warning("Timeout re-loading configuration after reconnect")
+                    _LOGGER.warning("Reconnect: config timeout – using defaults")
+                    spa._use_cameo_880_defaults()  # noqa: SLF001
             else:
                 _LOGGER.warning(
-                    "Reconnect attempt failed – will retry in %ds", RECONNECT_INTERVAL
+                    "Reconnect failed – retry in %ds", RECONNECT_INTERVAL
                 )
         except Exception as err:
             _LOGGER.error("Reconnect error: %s", err)
@@ -103,5 +123,4 @@ async def async_unload_entry(hass: HomeAssistant, entry: SundanceConfigEntry) ->
     """Unload a config entry."""
     if unload_ok := await hass.config_entries.async_unload_platforms(entry, PLATFORMS):
         await entry.runtime_data.disconnect()
-
     return unload_ok
