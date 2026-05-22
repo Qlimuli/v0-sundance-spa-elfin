@@ -1,8 +1,7 @@
 {
-  "name": "Sundance Spa (Elfin/EW11 WiFi)",
-  "render_readme": true,
-  "homeassistant": "2024.1.0",
-  "content_in_root": false,
-  "filename": "sundance_elfin.zip",
-  "country": ["DE", "AT", "CH", "US", "CA", "GB"]
+  "name": "Sundance / Balboa Spa",
+  "domain": "sundance_spa",
+  "documentation": "https://github.com/HyperActiveJ/sundance780-jacuzzi-balboa-rs485-tcp",
+  "iot_class": "local_push",
+  "homeassistant": "2024.1.0"
 }

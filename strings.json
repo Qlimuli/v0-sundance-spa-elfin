@@ -1,0 +1,23 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "Sundance / Balboa Spa einrichten",
+        "description": "Gib die IP-Adresse und den TCP-Port des RS485-TCP-Adapters ein.",
+        "data": {
+          "host": "IP-Adresse / Hostname",
+          "port": "TCP-Port"
+        }
+      }
+    },
+    "error": {
+      "cannot_connect": "Verbindung fehlgeschlagen – IP oder Port prüfen",
+      "timeout":        "Timeout – Spa antwortet nicht",
+      "no_data":        "Verbunden, aber keine Spa-Daten empfangen",
+      "unknown":        "Unbekannter Fehler"
+    },
+    "abort": {
+      "already_configured": "Dieser Spa ist bereits eingerichtet"
+    }
+  }
+}
