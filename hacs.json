@@ -1,7 +1,7 @@
 {
-  "name": "Sundance / Balboa Spa",
-  "domain": "sundance_spa",
-  "documentation": "https://github.com/HyperActiveJ/sundance780-jacuzzi-balboa-rs485-tcp",
-  "iot_class": "local_push",
-  "homeassistant": "2024.1.0"
+  "name": "Sundance Balboa Spa",
+  "content_in_root": false,
+  "filename": "sundance_spa.zip",
+  "homeassistant": "2024.1.0",
+  "iot_class": "local_push"
 }
