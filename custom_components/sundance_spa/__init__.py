@@ -28,6 +28,12 @@ STATUS_UPDATE_ALT = 0x16
 LIGHTS_UPDATE_ALT = 0x23
 CC_REQ       = 0xCC
 CMD_CHANNEL  = 0x10
+CH_BROADCAST = 0xFE
+MSG_CHANNEL_REQ = 0x01
+MSG_CHANNEL_ASSIGN = 0x02
+MSG_NACK = 0x00
+MSG_SET_TEMP = 0xC6
+CLIENT_TYPE_PANEL = 0x02
 
 # Bekannte Button-Codes
 BTN_PUMP1      = 228
@@ -35,12 +41,6 @@ BTN_PUMP2      = 229
 BTN_CLEARRAY   = 239
 BTN_LIGHT      = 241
 BTN_ZIRK       = 242
-BTN_TEMP_UP    = 225
-BTN_TEMP_DOWN  = 226
-
-# Menü verlassen (Sundance Cameo / Balboa TP – u. a. 254 getestet)
-BTN_MENU_EXIT_CANDIDATES = (254, 255, 253, 252, 251, 250)
-
 HEAT_MODE_MAP  = {32: "AUTO", 34: "ECO", 36: "DAY"}
 DISPLAY_MAP = {
     22: "Solltemp-Änderung",
@@ -88,17 +88,61 @@ def _xormsg(data: bytes | bytearray) -> list[int]:
     return result
 
 
-def _build_cc(btn: int) -> bytes:
+def _build_cc(btn: int, channel: int = CMD_CHANNEL) -> bytes:
     ml  = 7
     msg = bytearray(9)
     msg[0] = M_STARTEND
     msg[1] = ml
-    msg[2] = CMD_CHANNEL
+    msg[2] = channel
     msg[3] = 0xBF
     msg[4] = CC_REQ
     msg[5] = btn & 0xFF
     msg[6] = 0
     msg[7] = _calc_cs(msg[1:ml], ml - 1)
+    msg[8] = M_STARTEND
+    return bytes(msg)
+
+
+def _build_channel_request() -> bytes:
+    """Channel-Assignment auf Broadcast 0xFE (Sundance Cameo / Balboa)."""
+    msg = bytearray(8)
+    msg[0] = M_STARTEND
+    msg[1] = 6
+    msg[2] = CH_BROADCAST
+    msg[3] = 0xBF
+    msg[4] = MSG_CHANNEL_REQ
+    msg[5] = CLIENT_TYPE_PANEL
+    msg[6] = _calc_cs(msg[1:6], 5)
+    msg[7] = M_STARTEND
+    return bytes(msg)
+
+
+def _build_nack(channel: int) -> bytes:
+    """Bereitschaft auf zugewiesenem Kanal signalisieren."""
+    msg = bytearray(8)
+    msg[0] = M_STARTEND
+    msg[1] = 6
+    msg[2] = channel
+    msg[3] = 0xBF
+    msg[4] = MSG_NACK
+    msg[5] = 0x00
+    msg[6] = _calc_cs(msg[1:6], 5)
+    msg[7] = M_STARTEND
+    return bytes(msg)
+
+
+def _build_c6_temp(target_temp: float, channel: int) -> bytes:
+    """Soll-Temperatur direkt setzen (raw = °C × 2)."""
+    raw_temp = int(round(target_temp * 2)) & 0xFF
+    msg = bytearray(9)
+    msg[0] = M_STARTEND
+    msg[1] = 7
+    msg[2] = channel
+    msg[3] = 0xBF
+    msg[4] = MSG_SET_TEMP
+    msg[5] = raw_temp
+    msg[6] = 0x00
+    msg[7] = _calc_cs(msg[1:7], 6)
     msg[8] = M_STARTEND
     return bytes(msg)
 
@@ -182,6 +226,8 @@ class SpaClient:
         self._connected = False
         self._lock = asyncio.Lock()
         self._cmd_lock = asyncio.Lock()
+        self._assigned_channel: int | None = None
+        self._channel_assigned = asyncio.Event()
 
     # ── Verbindung ────────────────────────────────────────────────
 
@@ -195,8 +241,16 @@ class SpaClient:
             sock.setsockopt(_s.IPPROTO_TCP, _s.TCP_NODELAY, 1)
         self._stop.clear()
         self._connected = True
+        self._assigned_channel = None
+        self._channel_assigned = asyncio.Event()
         self._recv_task = asyncio.create_task(self._receiver())
-        _LOGGER.info("Spa verbunden: %s:%s", self.host, self.port)
+        await self._assign_channel()
+        _LOGGER.info(
+            "Spa verbunden: %s:%s (Kanal 0x%02X)",
+            self.host,
+            self.port,
+            self._assigned_channel or 0,
+        )
 
     async def disconnect(self) -> None:
         self._connected = False
@@ -250,6 +304,25 @@ class SpaClient:
             mtype   = msg[4]
             channel = msg[2]
 
+            if mtype == MSG_CHANNEL_ASSIGN and len(msg) >= 7:
+                assigned = msg[5]
+                self._assigned_channel = assigned
+                self._channel_assigned.set()
+                _LOGGER.info("Spa-Kanal zugewiesen: 0x%02X", assigned)
+                continue
+
+            if mtype == MSG_CHANNEL_REQ and len(msg) >= 7:
+                ch = msg[2]
+                if ch not in (CH_BROADCAST, 0xFF):
+                    self._assigned_channel = ch
+                    self._channel_assigned.set()
+                    _LOGGER.info("Spa-Kanal aus Antwort 0x01: 0x%02X", ch)
+                continue
+
+            if mtype == MSG_SET_TEMP:
+                _LOGGER.debug("C6-Antwort empfangen: %s", msg.hex())
+                continue
+
             if mtype == CLEAR_TO_SEND:
                 if channel == CMD_CHANNEL:
                     self._cts_ch += 1
@@ -277,6 +350,29 @@ class SpaClient:
                         self._lights_seq += 1
 
     # ── Senden ────────────────────────────────────────────────────
+
+    async def _write_direct(self, packet: bytes) -> None:
+        """Direkt senden (Channel-Request, NACK, C6 – ohne CTS-Queue)."""
+        if not self._writer:
+            raise UpdateFailed("Keine Verbindung zum Spa")
+        self._writer.write(packet)
+        await self._writer.drain()
+
+    async def _assign_channel(self) -> None:
+        """Bus-Kanal vom Spa anfordern (erforderlich für C6-Temperatur)."""
+        await asyncio.sleep(0.5)
+        await self._write_direct(_build_channel_request())
+        try:
+            await asyncio.wait_for(self._channel_assigned.wait(), timeout=10.0)
+        except asyncio.TimeoutError:
+            self._assigned_channel = CMD_CHANNEL
+            _LOGGER.warning(
+                "Kein Channel-Assignment – Fallback auf 0x%02X", CMD_CHANNEL
+            )
+        ch = self._assigned_channel or CMD_CHANNEL
+        self._assigned_channel = ch
+        await self._write_direct(_build_nack(ch))
+        await asyncio.sleep(0.3)
 
     async def send_button(self, btn: int) -> None:
         await self._send_q.put(_build_cc(btn))
@@ -326,136 +422,73 @@ class SpaClient:
     def is_connected(self) -> bool:
         return self._connected
 
+    @property
+    def assigned_channel(self) -> int | None:
+        return self._assigned_channel
+
     # ── Status-Helfer ─────────────────────────────────────────────
 
     async def _status_snapshot(self) -> dict | None:
         async with self._lock:
             return dict(self._status) if self._status else None
 
-    async def _send_button_wait_change(
-        self, btn: int, *, timeout: float = 5.0
-    ) -> bool:
-        """Sendet Button und wartet auf Änderung von d[8] oder Display."""
-        snap = await self._status_snapshot()
-        if not snap:
-            return False
-        before_d8 = snap["raw_d8"]
-        before_disp = snap["display_val"]
-        await self.send_button(btn)
-        elapsed = 0.0
-        while elapsed < timeout:
-            await asyncio.sleep(0.1)
-            elapsed += 0.1
-            cur = await self._status_snapshot()
-            if cur and (
-                cur["raw_d8"] != before_d8
-                or cur["display_val"] != before_disp
-            ):
-                await self.wait_status(n=6, timeout=3.0)
-                return True
-        return False
+    async def _ensure_channel(self) -> int:
+        if self._assigned_channel is not None:
+            return self._assigned_channel
+        await self._assign_channel()
+        return self._assigned_channel or CMD_CHANNEL
 
-    async def ensure_temp_adjustable(self, timeout: float = 75.0) -> None:
-        """Wartet bis Temp+/− wirken (nicht im Einstellungsmenü)."""
-        deadline = time.monotonic() + timeout
-
-        while time.monotonic() < deadline:
-            snap = await self._status_snapshot()
-            if snap and not snap["in_menu"]:
-                return
-            await asyncio.sleep(0.5)
-
-        _LOGGER.info(
-            "Spa noch im Menü (Display %s) – versuche Menü-Exit-Buttons",
-            (await self._status_snapshot() or {}).get("display_val"),
-        )
-        async with self._cmd_lock:
-            for btn in BTN_MENU_EXIT_CANDIDATES:
-                snap = await self._status_snapshot()
-                if not snap or not snap["in_menu"]:
-                    return
-                if await self._send_button_wait_change(btn, timeout=4.0):
-                    snap = await self._status_snapshot()
-                    if snap and not snap["in_menu"]:
-                        _LOGGER.info("Menü verlassen mit Button %s", btn)
-                        return
-                await asyncio.sleep(0.25)
-
-        snap = await self._status_snapshot()
-        if snap and snap["in_menu"]:
-            raise UpdateFailed(
-                "Spa im Einstellungsmenü "
-                f"({snap.get('display', snap['display_val'])}). "
-                "Temperatur-Buttons werden dort ignoriert. "
-                "Bitte am Cameo-Panel das Menü verlassen oder die "
-                "Ersteinrichtung (z. B. Sprache) abschließen."
-            )
-
-    # ── Temperatur setzen ─────────────────────────────────────────
+    # ── Temperatur setzen (C6 + Channel-Assignment) ───────────────
 
     async def set_temperature(self, target: float) -> None:
-        """Ändert Soll-Temperatur in 0,5-°C-Schritten (Balboa d[8])."""
-        async with self._cmd_lock:
-            await self.ensure_temp_adjustable()
+        """Setzt Soll-Temperatur per C6-Befehl auf dem zugewiesenen Kanal."""
+        target = max(20.0, min(40.0, target))
+        raw_target = int(round(target * 2))
 
+        async with self._cmd_lock:
+            channel = await self._ensure_channel()
             snap = await self._status_snapshot()
             if not snap:
                 raise UpdateFailed("Kein Status vom Spa")
-
-            current = snap["set_temp"]
-            diff = target - current
-            if abs(diff) < 0.3:
+            if abs(snap["set_temp"] - target) < 0.3:
                 return
 
-            steps = min(int(round(abs(diff) / 0.5)), 40)
-            btn = BTN_TEMP_UP if diff > 0 else BTN_TEMP_DOWN
             _LOGGER.debug(
-                "Setze Soll-Temp %.1f -> %.1f (%s Schritte, BTN %s)",
-                current,
+                "C6 Soll-Temp %.1f °C (raw=%s) auf Kanal 0x%02X",
                 target,
-                steps,
-                btn,
+                raw_target,
+                channel,
             )
 
-            for step in range(steps):
-                snap = await self._status_snapshot()
-                if not snap:
-                    raise UpdateFailed("Verbindung zum Spa verloren")
-                if snap["in_menu"]:
-                    raise UpdateFailed(
-                        "Spa ist ins Menü gewechselt – Temperaturänderung abgebrochen"
-                    )
+            for attempt in range(3):
+                pkt = _build_c6_temp(target, channel)
+                await self._write_direct(pkt)
+                await self.wait_status(n=6, timeout=6.0)
 
-                before = snap["raw_d8"]
-                await self.send_button(btn)
-                confirmed = False
-                for _ in range(50):
-                    await asyncio.sleep(0.1)
+                deadline = time.monotonic() + 8.0
+                while time.monotonic() < deadline:
                     cur = await self._status_snapshot()
-                    if cur and cur["raw_d8"] != before:
-                        confirmed = True
-                        break
+                    if cur and (
+                        abs(cur["set_temp"] - target) < 0.3
+                        or cur["raw_d8"] == raw_target
+                    ):
+                        _LOGGER.info(
+                            "Soll-Temperatur auf %.1f °C gesetzt (Versuch %s)",
+                            cur["set_temp"],
+                            attempt + 1,
+                        )
+                        return
+                    await asyncio.sleep(0.1)
 
-                if not confirmed:
-                    _LOGGER.warning(
-                        "Temp-Schritt %s/%s ohne d[8]-Bestätigung (war %s)",
-                        step + 1,
-                        steps,
-                        before,
-                    )
-                await self.wait_status(n=8, timeout=4.0)
-                await asyncio.sleep(0.2)
-
-                cur = await self._status_snapshot()
-                if cur and abs(cur["set_temp"] - target) < 0.3:
-                    return
+                await self._write_direct(_build_nack(channel))
+                await asyncio.sleep(0.3)
 
             final = await self._status_snapshot()
-            if final and abs(final["set_temp"] - target) > 0.6:
-                raise UpdateFailed(
-                    f"Soll-Temperatur nur {final['set_temp']:.1f} °C "
-                    f"statt {target:.1f} °C – ggf. am Panel prüfen"
-                )
+            got = final["set_temp"] if final else None
+            raise UpdateFailed(
+                f"Soll-Temperatur konnte nicht auf {target:.1f} °C gesetzt werden "
+                f"(aktuell: {got} °C)"
+            )
 
 
 # ── DataUpdateCoordinator ────────────────────────────────────────────────────
