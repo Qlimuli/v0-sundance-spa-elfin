@@ -47,7 +47,7 @@ SWITCH_TYPES: list[SpaSwitch] = [
         getter=lambda s: s["circ"],
     ),
     SpaSwitch(
-        key="clearray", name="ClearRay UV",
+        key="clearray", name="Wasserfall-manuell",
         icon_on="mdi:uv-fast", icon_off="mdi:uv-fast",
         button=BTN_CLEARRAY,
         getter=lambda s: s["circ_manual"],
