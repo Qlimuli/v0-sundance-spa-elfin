@@ -10,6 +10,8 @@ from homeassistant.components.climate import (
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import UnitOfTemperature
 from homeassistant.core import HomeAssistant, callback
+from homeassistant.exceptions import HomeAssistantError
+from homeassistant.helpers.update_coordinator import UpdateFailed
 from homeassistant.helpers.entity import DeviceInfo
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
@@ -88,9 +90,12 @@ class SpaClimate(CoordinatorEntity, ClimateEntity):
         if not self._status:
             return {}
         return {
-            "heat_mode":  self._status["heat_mode"],
-            "in_menu":    self._status["in_menu"],
-            "spa_time":   self._status["time"],
+            "heat_mode":   self._status["heat_mode"],
+            "in_menu":     self._status["in_menu"],
+            "display":     self._status.get("display"),
+            "display_val": self._status["display_val"],
+            "spa_time":    self._status["time"],
+            "raw_d8":      self._status["raw_d8"],
         }
 
     # ── HA-Aktionen ──────────────────────────────────────────────
@@ -99,7 +104,10 @@ class SpaClimate(CoordinatorEntity, ClimateEntity):
         temp = kwargs.get("temperature")
         if temp is None:
             return
-        await self.coordinator.client.set_temperature(float(temp))
+        try:
+            await self.coordinator.client.set_temperature(float(temp))
+        except UpdateFailed as err:
+            raise HomeAssistantError(str(err)) from err
         await self.coordinator.async_request_refresh()
 
     async def async_set_hvac_mode(self, hvac_mode: HVACMode) -> None:
