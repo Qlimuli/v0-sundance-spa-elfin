@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from datetime import timedelta
 
 from homeassistant.config_entries import ConfigEntry
@@ -37,7 +38,22 @@ BTN_ZIRK       = 242
 BTN_TEMP_UP    = 225
 BTN_TEMP_DOWN  = 226
 
+# Menü verlassen (Sundance Cameo / Balboa TP – u. a. 254 getestet)
+BTN_MENU_EXIT_CANDIDATES = (254, 255, 253, 252, 251, 250)
+
 HEAT_MODE_MAP  = {32: "AUTO", 34: "ECO", 36: "DAY"}
+DISPLAY_MAP = {
+    22: "Solltemp-Änderung",
+    23: "Ist-Temperatur",
+    30: "Solltemperatur",
+    31: "Ist-Temperatur (idle)",
+    32: "Ist-Temperatur",
+    36: "Ist-Temperatur",
+    35: "Primärfiltration",
+    42: "Heizmodus",
+    3: "Einstellungs-Menü",
+    0: "Temperatureinheit",
+}
 LIGHT_MODE_MAP = {
     128: "Fast Blend", 127: "Slow Blend", 255: "Frozen Blend",
       2: "Blue",  7: "Violet", 6: "Red",   8: "Amber",
@@ -104,6 +120,7 @@ def _decode_c4(raw: bytes) -> dict | None:
         "circ_manual":   bool((d[1] >> 7) & 1),
         "circ_running":  bool((d[1] >> 5) & 1),
         "display_val":   d[13],
+        "display":       DISPLAY_MAP.get(d[13], f"Code {d[13]}"),
         "in_menu":       d[13] not in DISPLAY_TEMP_OK,
         "raw_d8":        d[8],
         "raw":           list(d),
@@ -164,6 +181,7 @@ class SpaClient:
         self._cts_ch = 0
         self._connected = False
         self._lock = asyncio.Lock()
+        self._cmd_lock = asyncio.Lock()
 
     # ── Verbindung ────────────────────────────────────────────────
 
@@ -308,34 +326,136 @@ class SpaClient:
     def is_connected(self) -> bool:
         return self._connected
 
+    # ── Status-Helfer ─────────────────────────────────────────────
+
+    async def _status_snapshot(self) -> dict | None:
+        async with self._lock:
+            return dict(self._status) if self._status else None
+
+    async def _send_button_wait_change(
+        self, btn: int, *, timeout: float = 5.0
+    ) -> bool:
+        """Sendet Button und wartet auf Änderung von d[8] oder Display."""
+        snap = await self._status_snapshot()
+        if not snap:
+            return False
+        before_d8 = snap["raw_d8"]
+        before_disp = snap["display_val"]
+        await self.send_button(btn)
+        elapsed = 0.0
+        while elapsed < timeout:
+            await asyncio.sleep(0.1)
+            elapsed += 0.1
+            cur = await self._status_snapshot()
+            if cur and (
+                cur["raw_d8"] != before_d8
+                or cur["display_val"] != before_disp
+            ):
+                await self.wait_status(n=6, timeout=3.0)
+                return True
+        return False
+
+    async def ensure_temp_adjustable(self, timeout: float = 75.0) -> None:
+        """Wartet bis Temp+/− wirken (nicht im Einstellungsmenü)."""
+        deadline = time.monotonic() + timeout
+
+        while time.monotonic() < deadline:
+            snap = await self._status_snapshot()
+            if snap and not snap["in_menu"]:
+                return
+            await asyncio.sleep(0.5)
+
+        _LOGGER.info(
+            "Spa noch im Menü (Display %s) – versuche Menü-Exit-Buttons",
+            (await self._status_snapshot() or {}).get("display_val"),
+        )
+        async with self._cmd_lock:
+            for btn in BTN_MENU_EXIT_CANDIDATES:
+                snap = await self._status_snapshot()
+                if not snap or not snap["in_menu"]:
+                    return
+                if await self._send_button_wait_change(btn, timeout=4.0):
+                    snap = await self._status_snapshot()
+                    if snap and not snap["in_menu"]:
+                        _LOGGER.info("Menü verlassen mit Button %s", btn)
+                        return
+                await asyncio.sleep(0.25)
+
+        snap = await self._status_snapshot()
+        if snap and snap["in_menu"]:
+            raise UpdateFailed(
+                "Spa im Einstellungsmenü "
+                f"({snap.get('display', snap['display_val'])}). "
+                "Temperatur-Buttons werden dort ignoriert. "
+                "Bitte am Cameo-Panel das Menü verlassen oder die "
+                "Ersteinrichtung (z. B. Sprache) abschließen."
+            )
+
     # ── Temperatur setzen ─────────────────────────────────────────
 
     async def set_temperature(self, target: float) -> None:
-        """Ändert Soll-Temperatur in 0.5-°C-Schritten."""
-        if not self._status:
-            raise UpdateFailed("Kein Status vom Spa")
-        if self._status["in_menu"]:
-            _LOGGER.warning("Spa im Menü – Temp-Befehl könnte ignoriert werden")
+        """Ändert Soll-Temperatur in 0,5-°C-Schritten (Balboa d[8])."""
+        async with self._cmd_lock:
+            await self.ensure_temp_adjustable()
 
-        current = self._status["set_temp"]
-        diff    = target - current
-        if abs(diff) < 0.3:
-            return
+            snap = await self._status_snapshot()
+            if not snap:
+                raise UpdateFailed("Kein Status vom Spa")
 
-        steps = int(round(abs(diff) / 0.5))
-        btn   = BTN_TEMP_UP if diff > 0 else BTN_TEMP_DOWN
+            current = snap["set_temp"]
+            diff = target - current
+            if abs(diff) < 0.3:
+                return
 
-        for _ in range(steps):
-            if not self._status:
-                break
-            before = self._status["raw_d8"]
-            await self.send_button(btn)
-            # Auf Bestätigung warten (max. 3 s)
-            for _ in range(30):
-                await asyncio.sleep(0.1)
-                if self._status and self._status["raw_d8"] != before:
-                    break
-            await asyncio.sleep(0.15)
+            steps = min(int(round(abs(diff) / 0.5)), 40)
+            btn = BTN_TEMP_UP if diff > 0 else BTN_TEMP_DOWN
+            _LOGGER.debug(
+                "Setze Soll-Temp %.1f -> %.1f (%s Schritte, BTN %s)",
+                current,
+                target,
+                steps,
+                btn,
+            )
+
+            for step in range(steps):
+                snap = await self._status_snapshot()
+                if not snap:
+                    raise UpdateFailed("Verbindung zum Spa verloren")
+                if snap["in_menu"]:
+                    raise UpdateFailed(
+                        "Spa ist ins Menü gewechselt – Temperaturänderung abgebrochen"
+                    )
+
+                before = snap["raw_d8"]
+                await self.send_button(btn)
+                confirmed = False
+                for _ in range(50):
+                    await asyncio.sleep(0.1)
+                    cur = await self._status_snapshot()
+                    if cur and cur["raw_d8"] != before:
+                        confirmed = True
+                        break
+
+                if not confirmed:
+                    _LOGGER.warning(
+                        "Temp-Schritt %s/%s ohne d[8]-Bestätigung (war %s)",
+                        step + 1,
+                        steps,
+                        before,
+                    )
+                await self.wait_status(n=8, timeout=4.0)
+                await asyncio.sleep(0.2)
+
+                cur = await self._status_snapshot()
+                if cur and abs(cur["set_temp"] - target) < 0.3:
+                    return
+
+            final = await self._status_snapshot()
+            if final and abs(final["set_temp"] - target) > 0.6:
+                raise UpdateFailed(
+                    f"Soll-Temperatur nur {final['set_temp']:.1f} °C "
+                    f"statt {target:.1f} °C – ggf. am Panel prüfen"
+                )
 
 
 # ── DataUpdateCoordinator ────────────────────────────────────────────────────
