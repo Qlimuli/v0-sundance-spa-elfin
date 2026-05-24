@@ -36,12 +36,13 @@ MSG_SET_TEMP      = 0xC6
 CLIENT_TYPE_PANEL = 0x02
 
 # ── Button-Codes ─────────────────────────────────────────────────────────────
-BTN_PUMP1    = 228   # Pumpe 1
-BTN_PUMP2    = 229   # Pumpe 2
-BTN_CLEARRAY = 239   # ClearRay UV / Wasserfall manuell
-BTN_LIGHT    = 241   # Licht
-BTN_ZIRK     = 242   # Zirkulation
-BTN_BLOWER   = 243   # Blubber / Luftsprudel  ← NEU
+BTN_PUMP1       = 228
+BTN_PUMP2       = 229
+BTN_CLEARRAY    = 239
+BTN_LIGHT       = 241   # Licht An/Aus + Helligkeit-Stufe
+BTN_LIGHT_COLOR = 242   # Licht-Farbe / Effekt weiterschalten  ← NEU (war BTN_ZIRK)
+BTN_ZIRK        = 242   # Auto-Zirkulation  (gleicher Code! Kontext-abhängig)
+BTN_BLOWER      = 243   # Blubber / Luftsprudel
 
 # ── Lookup-Tabellen ──────────────────────────────────────────────────────────
 HEAT_MODE_MAP = {32: "AUTO", 34: "ECO", 36: "DAY"}
