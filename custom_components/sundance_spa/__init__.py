@@ -20,29 +20,32 @@ DOMAIN = "sundance_spa"
 PLATFORMS = [Platform.CLIMATE, Platform.SWITCH, Platform.LIGHT, Platform.SENSOR]
 
 # ── Protokoll-Konstanten ─────────────────────────────────────────────────────
-M_STARTEND   = 0x7E
-CLEAR_TO_SEND = 0x06
-STATUS_UPDATE = 0xC4
-LIGHTS_UPDATE = 0xCA
+M_STARTEND        = 0x7E
+CLEAR_TO_SEND     = 0x06
+STATUS_UPDATE     = 0xC4
+LIGHTS_UPDATE     = 0xCA
 STATUS_UPDATE_ALT = 0x16
 LIGHTS_UPDATE_ALT = 0x23
-CC_REQ       = 0xCC
-CMD_CHANNEL  = 0x10
-CH_BROADCAST = 0xFE
-MSG_CHANNEL_REQ = 0x01
+CC_REQ            = 0xCC
+CMD_CHANNEL       = 0x10
+CH_BROADCAST      = 0xFE
+MSG_CHANNEL_REQ   = 0x01
 MSG_CHANNEL_ASSIGN = 0x02
-MSG_NACK = 0x00
-MSG_SET_TEMP = 0xC6
+MSG_NACK          = 0x00
+MSG_SET_TEMP      = 0xC6
 CLIENT_TYPE_PANEL = 0x02
 
-# Bekannte Button-Codes
-BTN_PUMP1      = 228
-BTN_PUMP2      = 229
-BTN_CLEARRAY   = 239
-BTN_LIGHT      = 241
-BTN_ZIRK       = 242
-BTN_BLOWER     = 243
-HEAT_MODE_MAP  = {32: "AUTO", 34: "ECO", 36: "DAY"}
+# ── Button-Codes ─────────────────────────────────────────────────────────────
+BTN_PUMP1    = 228   # Pumpe 1
+BTN_PUMP2    = 229   # Pumpe 2
+BTN_CLEARRAY = 239   # ClearRay UV / Wasserfall manuell
+BTN_LIGHT    = 241   # Licht
+BTN_ZIRK     = 242   # Zirkulation
+BTN_BLOWER   = 243   # Blubber / Luftsprudel  ← NEU
+
+# ── Lookup-Tabellen ──────────────────────────────────────────────────────────
+HEAT_MODE_MAP = {32: "AUTO", 34: "ECO", 36: "DAY"}
+
 DISPLAY_MAP = {
     22: "Solltemp-Änderung",
     23: "Ist-Temperatur",
@@ -52,14 +55,16 @@ DISPLAY_MAP = {
     36: "Ist-Temperatur",
     35: "Primärfiltration",
     42: "Heizmodus",
-    3: "Einstellungs-Menü",
-    0: "Temperatureinheit",
+     3: "Einstellungs-Menü",
+     0: "Temperatureinheit",
 }
+
 LIGHT_MODE_MAP = {
     128: "Fast Blend", 127: "Slow Blend", 255: "Frozen Blend",
       2: "Blue",  7: "Violet", 6: "Red",   8: "Amber",
       3: "Green", 9: "Aqua",   1: "White", 0: "Off",
 }
+
 DISPLAY_TEMP_OK = {22, 23, 30, 31, 32, 36}
 
 
@@ -154,22 +159,24 @@ def _decode_c4(raw: bytes) -> dict | None:
         return None
     circ = (d[1] >> 6) & 1
     return {
-        "time":          f"{d[0] ^ 6:02d}:{d[11]:02d}",
-        "cur_temp":      (d[5] ^ 2) / 2.0 if (d[5] ^ 2) != 255 else None,
-        "set_temp":      d[8] / 2.0,
-        "heat_active":   bool((d[10] >> 6) & 1),
-        "heat_mode":     HEAT_MODE_MAP.get(d[6], f"0x{d[6]:02X}"),
-        "pump1":         bool((d[2] >> 4) & 1),
-        "pump2":         bool((d[1] >> 2) & 1),
-        "circ":          bool(circ),
-        "circ_manual":   bool((d[1] >> 7) & 1),
-        "circ_running":  bool((d[1] >> 5) & 1),
-        "blower":        bool((d[13] >> 2) & 0x03 != 0),
-        "display_val":   d[13],
-        "display":       DISPLAY_MAP.get(d[13], f"Code {d[13]}"),
-        "in_menu":       d[13] not in DISPLAY_TEMP_OK,
-        "raw_d8":        d[8],
-        "raw":           list(d),
+        "time":         f"{d[0] ^ 6:02d}:{d[11]:02d}",
+        "cur_temp":     (d[5] ^ 2) / 2.0 if (d[5] ^ 2) != 255 else None,
+        "set_temp":     d[8] / 2.0,
+        "heat_active":  bool((d[10] >> 6) & 1),
+        "heat_mode":    HEAT_MODE_MAP.get(d[6], f"0x{d[6]:02X}"),
+        "pump1":        bool((d[2] >> 4) & 1),
+        "pump2":        bool((d[1] >> 2) & 1),
+        "circ":         bool(circ),
+        "circ_manual":  bool((d[1] >> 7) & 1),
+        "circ_running": bool((d[1] >> 5) & 1),
+        # Blower/Blubber: Feld 13, Bits 2-3 (Balboa Standard)
+        # Falls der Wert immer 0 ist → Button-Code per Sniffing bestimmen
+        "blower":       bool((d[13] >> 2) & 0x03),
+        "display_val":  d[13],
+        "display":      DISPLAY_MAP.get(d[13], f"Code {d[13]}"),
+        "in_menu":      d[13] not in DISPLAY_TEMP_OK,
+        "raw_d8":       d[8],
+        "raw":          list(d),
     }
 
 
@@ -178,22 +185,22 @@ def _decode_ca(raw: bytes) -> dict | None:
     if len(d) < 10:
         return None
     return {
-        "on":         d[1] > 0,
-        "brightness": round(d[1] / 2.55),          # 0-100 %
+        "on":             d[1] > 0,
+        "brightness":     round(d[1] / 2.55),
         "brightness_raw": d[1],
-        "mode":       LIGHT_MODE_MAP.get(d[4], f"0x{d[4]:02X}"),
-        "mode_raw":   d[4],
+        "mode":           LIGHT_MODE_MAP.get(d[4], f"0x{d[4]:02X}"),
+        "mode_raw":       d[4],
         "r": d[8], "g": d[6], "b": d[2],
-        "hs_color":   _rgb_to_hs(d[8], d[6], d[2]),
-        "raw":        list(d),
+        "hs_color":       _rgb_to_hs(d[8], d[6], d[2]),
+        "raw":            list(d),
     }
 
 
 def _rgb_to_hs(r: int, g: int, b: int) -> tuple[float, float]:
     """Minimal RGB → (Hue 0-360, Saturation 0-100) ohne externe Libs."""
     r_, g_, b_ = r / 255.0, g / 255.0, b / 255.0
-    cmax = max(r_, g_, b_)
-    cmin = min(r_, g_, b_)
+    cmax  = max(r_, g_, b_)
+    cmin  = min(r_, g_, b_)
     delta = cmax - cmin
     if delta == 0:
         h = 0.0
@@ -503,9 +510,6 @@ class SpaCoordinator(DataUpdateCoordinator):
             hass,
             _LOGGER,
             name=DOMAIN,
-            # Kein Polling nötig – Spa pusht Daten kontinuierlich.
-            # update_interval sorgt aber dafür, dass HA-Entities
-            # zuverlässig refresht werden.
             update_interval=timedelta(seconds=5),
         )
         self.client = client
