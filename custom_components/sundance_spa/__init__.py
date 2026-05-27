@@ -1,8 +1,6 @@
 """
 Sundance / Balboa Spa – Home Assistant Integration
 Protokoll-Engine + DataUpdateCoordinator in einer Datei.
-
-Getestet mit: Sundance Cameo 880 über RS485-TCP-Bridge (Elfin EW11 / ESPHome).
 """
 from __future__ import annotations
 
@@ -37,15 +35,14 @@ MSG_NACK          = 0x00
 MSG_SET_TEMP      = 0xC6
 CLIENT_TYPE_PANEL = 0x02
 
-# ── Button-Codes (Sundance Cameo 880) ────────────────────────────────────────
-# Quelle: HyperActiveJ/sundance780-jacuzzi-balboa-rs485-tcp
-BTN_PUMP1       = 228   # 0xE4
-BTN_PUMP2       = 229   # 0xE5
-BTN_BLOWER      = 12    # 0x0C  ← FIX: Cameo 880 nutzt nicht 243!
-BTN_CLEARRAY    = 239   # 0xEF
-BTN_LIGHT       = 241   # 0xF1  Licht An/Aus + Helligkeit
-BTN_LIGHT_COLOR = 242   # 0xF2  Farbe/Effekt weiterschalten
-BTN_ZIRK        = 242   # gleicher Code – kontextabhängig
+# ── Button-Codes ─────────────────────────────────────────────────────────────
+BTN_PUMP1       = 228
+BTN_PUMP2       = 229
+BTN_CLEARRAY    = 239
+BTN_LIGHT       = 241   # Licht An/Aus + Helligkeit-Stufe
+BTN_LIGHT_COLOR = 242   # Licht-Farbe / Effekt weiterschalten  ← NEU (war BTN_ZIRK)
+BTN_ZIRK        = 242   # Auto-Zirkulation  (gleicher Code! Kontext-abhängig)
+BTN_BLOWER      = 243   # Blubber / Luftsprudel
 
 # ── Lookup-Tabellen ──────────────────────────────────────────────────────────
 HEAT_MODE_MAP = {32: "AUTO", 34: "ECO", 36: "DAY"}
@@ -114,6 +111,7 @@ def _build_cc(btn: int, channel: int = CMD_CHANNEL) -> bytes:
 
 
 def _build_channel_request() -> bytes:
+    """Channel-Assignment auf Broadcast 0xFE (Sundance Cameo / Balboa)."""
     msg = bytearray(8)
     msg[0] = M_STARTEND
     msg[1] = 6
@@ -127,6 +125,7 @@ def _build_channel_request() -> bytes:
 
 
 def _build_nack(channel: int) -> bytes:
+    """Bereitschaft auf zugewiesenem Kanal signalisieren."""
     msg = bytearray(8)
     msg[0] = M_STARTEND
     msg[1] = 6
@@ -139,72 +138,31 @@ def _build_nack(channel: int) -> bytes:
     return bytes(msg)
 
 
-def _build_c6_temp(raw_temp: int, channel: int) -> bytes:
-    """
-    Soll-Temperatur direkt setzen.
-
-    WICHTIG: raw_temp ist bereits der protokoll-korrekte Rohwert!
-      - Bei °F-Anzeige im Spa: raw = round(°F)            (z. B. 102 °F → 102)
-      - Bei °C-Anzeige im Spa: raw = round(°C × 2)        (z. B. 38,5 °C → 77)
-
-    Frame-Layout (8 Byte, ml=6):
-      7E 06 <ch> BF C6 <raw> <CS> 7E
-    """
-    msg = bytearray(8)
+def _build_c6_temp(target_temp: float, channel: int) -> bytes:
+    """Soll-Temperatur direkt setzen (raw = °C × 2)."""
+    raw_temp = int(round(target_temp * 2)) & 0xFF
+    msg = bytearray(9)
     msg[0] = M_STARTEND
-    msg[1] = 6                        # ← FIX: ml=6 (nicht 7!)
+    msg[1] = 7
     msg[2] = channel
     msg[3] = 0xBF
     msg[4] = MSG_SET_TEMP
-    msg[5] = raw_temp & 0xFF
-    msg[6] = _calc_cs(msg[1:6], 5)
-    msg[7] = M_STARTEND
+    msg[5] = raw_temp
+    msg[6] = 0x00
+    msg[7] = _calc_cs(msg[1:7], 6)
+    msg[8] = M_STARTEND
     return bytes(msg)
 
 
 def _decode_c4(raw: bytes) -> dict | None:
-    """
-    Decodiert C4-Status-Frame.
-
-    Wichtig für Cameo 880:
-      - d[8]  = Soll-Temp Rohwert (°F direkt ODER °C×2, abhängig von Modus)
-      - d[9]  = Flags inkl. Temperatur-Einheit (Bit 0: 0=°F, 1=°C)  – beim 880 oft d[14]
-      - d[13] = Display-Code
-      - d[3]  = Aux-Outputs (Blower)
-    """
     d = _xormsg(raw[5:len(raw) - 2])
     if len(d) < 15:
         return None
-
-    # Temperatur-Einheit ermitteln
-    # Beim Cameo 880 liegt das Unit-Bit in Feld 9, Bit 0.
-    # Fallback-Heuristik: Wenn d[8] > 80, ist es sehr wahrscheinlich °F.
-    unit_bit = (d[9] >> 0) & 1 if len(d) > 9 else 0
-    is_celsius = bool(unit_bit)
-
-    raw_set = d[8]
-    raw_cur = d[5] ^ 2
-
-    if is_celsius:
-        set_temp = raw_set / 2.0
-        cur_temp = raw_cur / 2.0 if raw_cur != 255 else None
-    else:
-        # °F → °C umrechnen für HA-Anzeige
-        set_temp = round((raw_set - 32) * 5 / 9, 1)
-        cur_temp = round((raw_cur - 32) * 5 / 9, 1) if raw_cur != 255 else None
-
     circ = (d[1] >> 6) & 1
-
-    # ── Blower-Bit beim Cameo 880 ──
-    # Feld 3, Bits 2-3 (Aux1/Aux2 Outputs).
-    # Falls bei dir hier 0 bleibt: blower_raw_field3/13/14 in HA prüfen
-    # und ggf. Bit-Maske anpassen.
-    blower = bool((d[3] >> 2) & 0x03)
-
     return {
         "time":         f"{d[0] ^ 6:02d}:{d[11]:02d}",
-        "cur_temp":     cur_temp,
-        "set_temp":     set_temp,
+        "cur_temp":     (d[5] ^ 2) / 2.0 if (d[5] ^ 2) != 255 else None,
+        "set_temp":     d[8] / 2.0,
         "heat_active":  bool((d[10] >> 6) & 1),
         "heat_mode":    HEAT_MODE_MAP.get(d[6], f"0x{d[6]:02X}"),
         "pump1":        bool((d[2] >> 4) & 1),
@@ -212,12 +170,13 @@ def _decode_c4(raw: bytes) -> dict | None:
         "circ":         bool(circ),
         "circ_manual":  bool((d[1] >> 7) & 1),
         "circ_running": bool((d[1] >> 5) & 1),
-        "blower":       blower,
+        # Blower/Blubber: Feld 13, Bits 2-3 (Balboa Standard)
+        # Falls der Wert immer 0 ist → Button-Code per Sniffing bestimmen
+        "blower":       bool((d[13] >> 2) & 0x03),
         "display_val":  d[13],
         "display":      DISPLAY_MAP.get(d[13], f"Code {d[13]}"),
         "in_menu":      d[13] not in DISPLAY_TEMP_OK,
         "raw_d8":       d[8],
-        "is_celsius":   is_celsius,
         "raw":          list(d),
     }
 
@@ -239,6 +198,7 @@ def _decode_ca(raw: bytes) -> dict | None:
 
 
 def _rgb_to_hs(r: int, g: int, b: int) -> tuple[float, float]:
+    """Minimal RGB → (Hue 0-360, Saturation 0-100) ohne externe Libs."""
     r_, g_, b_ = r / 255.0, g / 255.0, b / 255.0
     cmax  = max(r_, g_, b_)
     cmin  = min(r_, g_, b_)
@@ -253,27 +213,6 @@ def _rgb_to_hs(r: int, g: int, b: int) -> tuple[float, float]:
         h = 60 * (((r_ - g_) / delta) + 4)
     s = 0.0 if cmax == 0 else (delta / cmax) * 100
     return round(h, 1), round(s, 1)
-
-
-def _celsius_to_raw(target_c: float, is_celsius_mode: bool) -> int:
-    """
-    Wandelt eine Ziel-Temperatur in °C in den protokoll-korrekten Rohwert.
-
-      - Spa im °C-Mode: raw = round(°C × 2)        (Step 0,5 °C)
-      - Spa im °F-Mode: raw = round(°C → °F)       (Step 1 °F)
-    """
-    if is_celsius_mode:
-        # auf 0,5-Schritt runden
-        return int(round(target_c * 2))
-    # auf ganze °F runden
-    target_f = target_c * 9 / 5 + 32
-    return int(round(target_f))
-
-
-def _raw_to_celsius(raw: int, is_celsius_mode: bool) -> float:
-    if is_celsius_mode:
-        return raw / 2.0
-    return round((raw - 32) * 5 / 9, 1)
 
 
 # ── SpaClient: TCP-Verbindung & Sende-Queue ──────────────────────────────────
@@ -423,12 +362,14 @@ class SpaClient:
     # ── Senden ────────────────────────────────────────────────────
 
     async def _write_direct(self, packet: bytes) -> None:
+        """Direkt senden (Channel-Request, NACK, C6 – ohne CTS-Queue)."""
         if not self._writer:
             raise UpdateFailed("Keine Verbindung zum Spa")
         self._writer.write(packet)
         await self._writer.drain()
 
     async def _assign_channel(self) -> None:
+        """Bus-Kanal vom Spa anfordern (erforderlich für C6-Temperatur)."""
         await asyncio.sleep(0.5)
         await self._write_direct(_build_channel_request())
         try:
@@ -507,48 +448,30 @@ class SpaClient:
         await self._assign_channel()
         return self._assigned_channel or CMD_CHANNEL
 
-    # ── Temperatur setzen (C6) ────────────────────────────────────
+    # ── Temperatur setzen (C6 + Channel-Assignment) ───────────────
 
     async def set_temperature(self, target: float) -> None:
-        """
-        Setzt Soll-Temperatur per C6-Befehl.
-
-        Berücksichtigt die im Spa eingestellte Anzeige-Einheit (°C oder °F).
-        target ist IMMER in °C (HA-Standard).
-        """
-        # Hardware-Limits Cameo 880: 26.5 °C (80 °F) bis 40 °C (104 °F)
-        target = max(26.5, min(40.0, target))
+        """Setzt Soll-Temperatur per C6-Befehl auf dem zugewiesenen Kanal."""
+        target = max(20.0, min(40.0, target))
+        raw_target = int(round(target * 2))
 
         async with self._cmd_lock:
             channel = await self._ensure_channel()
             snap = await self._status_snapshot()
             if not snap:
                 raise UpdateFailed("Kein Status vom Spa")
-
-            is_celsius = snap.get("is_celsius", False)
-            raw_target = _celsius_to_raw(target, is_celsius)
-            actual_target_c = _raw_to_celsius(raw_target, is_celsius)
-
-            # Toleranz an Mode anpassen
-            tolerance = 0.3 if is_celsius else 0.6  # 1 °F ≈ 0,55 °C
-
-            if abs(snap["set_temp"] - actual_target_c) < tolerance:
-                _LOGGER.debug(
-                    "Soll-Temp bereits %.1f °C (Ziel %.1f °C) – kein Senden",
-                    snap["set_temp"], actual_target_c,
-                )
+            if abs(snap["set_temp"] - target) < 0.3:
                 return
 
-            _LOGGER.info(
-                "C6 Soll-Temp setzen: %.1f °C → raw=%d (%s-Mode) auf Kanal 0x%02X",
-                actual_target_c, raw_target,
-                "°C" if is_celsius else "°F",
+            _LOGGER.debug(
+                "C6 Soll-Temp %.1f °C (raw=%s) auf Kanal 0x%02X",
+                target,
+                raw_target,
                 channel,
             )
 
             for attempt in range(3):
-                pkt = _build_c6_temp(raw_target, channel)
-                _LOGGER.debug("C6-Paket (Versuch %d): %s", attempt + 1, pkt.hex())
+                pkt = _build_c6_temp(target, channel)
                 await self._write_direct(pkt)
                 await self.wait_status(n=6, timeout=6.0)
 
@@ -556,26 +479,25 @@ class SpaClient:
                 while time.monotonic() < deadline:
                     cur = await self._status_snapshot()
                     if cur and (
-                        abs(cur["set_temp"] - actual_target_c) < tolerance
+                        abs(cur["set_temp"] - target) < 0.3
                         or cur["raw_d8"] == raw_target
                     ):
                         _LOGGER.info(
-                            "Soll-Temperatur erfolgreich auf %.1f °C gesetzt "
-                            "(raw=%d, Versuch %d)",
-                            cur["set_temp"], cur["raw_d8"], attempt + 1,
+                            "Soll-Temperatur auf %.1f °C gesetzt (Versuch %s)",
+                            cur["set_temp"],
+                            attempt + 1,
                         )
                         return
                     await asyncio.sleep(0.1)
 
-                _LOGGER.debug("Versuch %d fehlgeschlagen, retry…", attempt + 1)
-                await asyncio.sleep(0.5)
+                await self._write_direct(_build_nack(channel))
+                await asyncio.sleep(0.3)
 
             final = await self._status_snapshot()
             got = final["set_temp"] if final else None
             raise UpdateFailed(
-                f"Soll-Temperatur konnte nicht auf {actual_target_c:.1f} °C "
-                f"gesetzt werden (aktuell: {got} °C, raw_target={raw_target}, "
-                f"mode={'°C' if is_celsius else '°F'})"
+                f"Soll-Temperatur konnte nicht auf {target:.1f} °C gesetzt werden "
+                f"(aktuell: {got} °C)"
             )
 
 
