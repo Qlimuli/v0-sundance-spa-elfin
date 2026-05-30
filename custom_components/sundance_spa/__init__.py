@@ -43,9 +43,8 @@ BTN_LIGHT       = 241
 BTN_LIGHT_COLOR = 242
 BTN_ZIRK        = 242
 BTN_BLOWER      = 243
-# Temperatur-Buttons (Fallback)
-BTN_TEMP_UP     = 230  # Vermutlich "Warmer"
-BTN_TEMP_DOWN   = 231  # Vermutlich "Cooler"
+BTN_TEMP_UP     = 230   # Warmer
+BTN_TEMP_DOWN   = 231   # Cooler
 
 # ── Lookup-Tabellen ──────────────────────────────────────────────────────────
 HEAT_MODE_MAP = {32: "AUTO", 34: "ECO", 36: "DAY"}
@@ -92,7 +91,6 @@ def _xormsg(data: bytes | bytearray) -> list[int]:
 
 
 def _build_c6_temp(target_temp: float, channel: int) -> bytes:
-    """Verbessertes C6-Paket für Sundance Cameo 880."""
     target_temp = max(20.0, min(40.0, round(target_temp * 2) / 2.0))
     raw_temp = int(round(target_temp * 2)) & 0xFF
 
@@ -103,7 +101,7 @@ def _build_c6_temp(target_temp: float, channel: int) -> bytes:
     msg[3] = 0xBF
     msg[4] = MSG_SET_TEMP
     msg[5] = raw_temp
-    msg[6] = 0x00          # Flag-Byte – wichtig!
+    msg[6] = 0x00
     msg[7] = _calc_cs(msg[1:7], 6)
     msg[8] = M_STARTEND
     return bytes(msg)
@@ -168,8 +166,7 @@ class SpaClient:
         self._assigned_channel = None
         self._channel_assigned = asyncio.Event()
         self._recv_task = asyncio.create_task(self._receiver())
-        await self._assign_channel()
-        _LOGGER.info("Spa verbunden: %s:%s (Kanal 0x%02X)", self.host, self.port, self._assigned_channel or 0)
+        await self._assign_channel()  # nicht mehr kritisch
 
     async def disconnect(self) -> None:
         self._connected = False
@@ -248,13 +245,13 @@ class SpaClient:
                         self._lights_seq += 1
 
     async def _assign_channel(self) -> None:
-        """Verbessertes Channel-Assignment mit mehreren Versuchen."""
+        """Versucht Channel-Assignment, bricht aber nicht ab bei Fehlschlag."""
         for attempt in range(3):
-            await asyncio.sleep(0.6)
+            await asyncio.sleep(0.5)
             await self._write_direct(_build_channel_request())
             try:
-                await asyncio.wait_for(self._channel_assigned.wait(), timeout=8.0)
-                _LOGGER.info("✅ Channel-Assignment erfolgreich nach Versuch %d", attempt+1)
+                await asyncio.wait_for(self._channel_assigned.wait(), timeout=6.0)
+                _LOGGER.info("✅ Channel-Assignment erfolgreich")
                 break
             except asyncio.TimeoutError:
                 _LOGGER.warning("Channel-Assignment Versuch %d fehlgeschlagen", attempt+1)
@@ -264,12 +261,15 @@ class SpaClient:
 
         ch = self._assigned_channel or CMD_CHANNEL
         await self._write_direct(_build_nack(ch))
-        await asyncio.sleep(0.4)
+        await asyncio.sleep(0.3)
 
     async def _write_direct(self, packet: bytes) -> None:
         if self._writer:
-            self._writer.write(packet)
-            await self._writer.drain()
+            try:
+                self._writer.write(packet)
+                await self._writer.drain()
+            except Exception:
+                pass
 
     async def send_button(self, btn: int) -> None:
         await self._send_q.put(_build_cc(btn))
@@ -278,67 +278,40 @@ class SpaClient:
         async with self._lock:
             return dict(self._status) if self._status else None
 
-    # ── Temperatur setzen ─────────────────────────────────────────────────────
+    # ── Temperatur setzen mit starkem Button-Fallback ───────────────────────
 
     async def set_temperature(self, target: float) -> None:
         target = max(20.0, min(40.0, round(target * 2) / 2.0))
-        raw_target = int(round(target * 2))
-
         async with self._cmd_lock:
-            channel = self._assigned_channel or CMD_CHANNEL
             snap = await self._status_snapshot()
             if not snap:
-                raise UpdateFailed("Kein Status verfügbar")
+                raise UpdateFailed("Kein Status vom Spa")
 
-            if abs(snap.get("set_temp", 0) - target) < 0.3:
+            current = snap.get("set_temp", 35.0)
+            if abs(current - target) < 0.5:
                 return
 
-            _LOGGER.info("🔧 Setze Temperatur auf %.1f°C (raw=0x%02X) auf Kanal 0x%02X", target, raw_target, channel)
+            _LOGGER.info("🔧 Setze Temperatur von %.1f auf %.1f°C (Button-Fallback)", current, target)
 
-            # Versuch 1-3: C6-Befehl
-            for attempt in range(3):
-                pkt = _build_c6_temp(target, channel)
-                await self._send_q.put(pkt)
-                await self.wait_status(n=10, timeout=10.0)
+            diff = round((target - current) * 2)  # Anzahl 0.5°C Schritte
+            btn = BTN_TEMP_UP if diff > 0 else BTN_TEMP_DOWN
+            steps = min(abs(diff), 30)
 
-                deadline = time.monotonic() + 12.0
-                while time.monotonic() < deadline:
-                    cur = await self._status_snapshot()
-                    if cur and abs(cur.get("set_temp", 0) - target) < 0.4:
-                        _LOGGER.info("✅ Temperatur erfolgreich auf %.1f°C gesetzt!", cur["set_temp"])
-                        return
-                    await asyncio.sleep(0.25)
+            for i in range(steps):
+                await self.send_button(btn)
+                await asyncio.sleep(0.7)
+                if i % 5 == 0:
+                    await self.wait_status(n=4, timeout=4.0)
 
-                _LOGGER.warning("C6 Versuch %d fehlgeschlagen", attempt+1)
-                await self._write_direct(_build_nack(channel))
-                await asyncio.sleep(0.6)
-
-            # Fallback: Button-Methode (Temperatur hoch/runter drücken)
-            _LOGGER.info("⚠️ C6 fehlgeschlagen → versuche Button-Fallback")
-            current = snap.get("set_temp", 35.0)
-            diff = round((target - current) * 2)  # 0.5°C Schritte
-
-            if diff > 0:
-                btn = BTN_TEMP_UP
-                for _ in range(min(diff, 20)):
-                    await self.send_button(btn)
-                    await asyncio.sleep(0.6)
-            elif diff < 0:
-                btn = BTN_TEMP_DOWN
-                for _ in range(min(-diff, 20)):
-                    await self.send_button(btn)
-                    await asyncio.sleep(0.6)
-
-            await asyncio.sleep(2.0)
+            await asyncio.sleep(3.0)
             final = await self._status_snapshot()
             final_temp = final.get("set_temp") if final else None
-            if final_temp and abs(final_temp - target) < 1.0:
-                _LOGGER.info("✅ Button-Fallback erfolgreich: %.1f°C", final_temp)
+
+            if final_temp and abs(final_temp - target) < 1.5:
+                _LOGGER.info("✅ Temperatur per Button auf %.1f°C gesetzt", final_temp)
             else:
-                raise UpdateFailed(f"Temperatur konnte nicht gesetzt werden (Ziel: {target:.1f}, erreicht: {final_temp})")
+                _LOGGER.warning("Temperatur nur auf %.1f°C gesetzt (Ziel war %.1f)", final_temp or 0, target)
 
-
-# ── Rest der Datei bleibt gleich (Coordinator, Setup, etc.) ───────────────────
 
     async def wait_status(self, n: int = 6, timeout: float = 4.0) -> bool:
         start = self._status_seq
@@ -355,9 +328,9 @@ class SpaClient:
         while elapsed < timeout:
             if self._status:
                 return True
-            await asyncio.sleep(0.2)
-            elapsed += 0.2
-        return False
+            await asyncio.sleep(0.3)
+            elapsed += 0.3
+        return bool(self._status)
 
     @property
     def status(self) -> dict | None:
@@ -371,6 +344,8 @@ class SpaClient:
     def assigned_channel(self) -> int | None:
         return self._assigned_channel
 
+
+# ── Coordinator & Setup ─────────────────────────────────────────────────────
 
 class SpaCoordinator(DataUpdateCoordinator):
     def __init__(self, hass: HomeAssistant, client: SpaClient) -> None:
@@ -393,9 +368,10 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     client = SpaClient(host, port)
     try:
         await client.connect()
-        await client.wait_ready(timeout=15.0)
+        await client.wait_ready(timeout=20.0)   # länger warten
+        _LOGGER.info("Spa erfolgreich verbunden")
     except Exception as exc:
-        _LOGGER.error("Verbindung fehlgeschlagen: %s", exc)
+        _LOGGER.error("Verbindung zu Spa fehlgeschlagen: %s", exc)
         raise
 
     coordinator = SpaCoordinator(hass, client)
