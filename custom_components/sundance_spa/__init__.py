@@ -39,10 +39,10 @@ CLIENT_TYPE_PANEL = 0x02
 BTN_PUMP1       = 228
 BTN_PUMP2       = 229
 BTN_CLEARRAY    = 239
-BTN_LIGHT       = 241
-BTN_LIGHT_COLOR = 242
-BTN_ZIRK        = 242
-BTN_BLOWER      = 243
+BTN_LIGHT       = 241   # Licht An/Aus + Helligkeit-Stufe
+BTN_LIGHT_COLOR = 242   # Licht-Farbe / Effekt weiterschalten  ← NEU (war BTN_ZIRK)
+BTN_ZIRK        = 242   # Auto-Zirkulation  (gleicher Code! Kontext-abhängig)
+BTN_BLOWER      = 243   # Blubber / Luftsprudel
 
 # ── Lookup-Tabellen ──────────────────────────────────────────────────────────
 HEAT_MODE_MAP = {32: "AUTO", 34: "ECO", 36: "DAY"}
@@ -111,6 +111,7 @@ def _build_cc(btn: int, channel: int = CMD_CHANNEL) -> bytes:
 
 
 def _build_channel_request() -> bytes:
+    """Channel-Assignment auf Broadcast 0xFE (Sundance Cameo / Balboa)."""
     msg = bytearray(8)
     msg[0] = M_STARTEND
     msg[1] = 6
@@ -124,6 +125,7 @@ def _build_channel_request() -> bytes:
 
 
 def _build_nack(channel: int) -> bytes:
+    """Bereitschaft auf zugewiesenem Kanal signalisieren."""
     msg = bytearray(8)
     msg[0] = M_STARTEND
     msg[1] = 6
@@ -137,11 +139,8 @@ def _build_nack(channel: int) -> bytes:
 
 
 def _build_c6_temp(target_temp: float, channel: int) -> bytes:
-    """Original + verbessertes Logging + 0.5°C Rundung"""
-    target_temp = max(20.0, min(40.0, round(target_temp * 2) / 2.0))
+    """Soll-Temperatur direkt setzen (raw = °C × 2)."""
     raw_temp = int(round(target_temp * 2)) & 0xFF
-    _LOGGER.debug("Baue C6-Paket: Ziel=%.1f°C → raw=0x%02X auf Kanal 0x%02X", target_temp, raw_temp, channel)
-    
     msg = bytearray(9)
     msg[0] = M_STARTEND
     msg[1] = 7
@@ -171,6 +170,8 @@ def _decode_c4(raw: bytes) -> dict | None:
         "circ":         bool(circ),
         "circ_manual":  bool((d[1] >> 7) & 1),
         "circ_running": bool((d[1] >> 5) & 1),
+        # Blower/Blubber: Feld 13, Bits 2-3 (Balboa Standard)
+        # Falls der Wert immer 0 ist → Button-Code per Sniffing bestimmen
         "blower":       bool((d[13] >> 2) & 0x03),
         "display_val":  d[13],
         "display":      DISPLAY_MAP.get(d[13], f"Code {d[13]}"),
@@ -197,6 +198,7 @@ def _decode_ca(raw: bytes) -> dict | None:
 
 
 def _rgb_to_hs(r: int, g: int, b: int) -> tuple[float, float]:
+    """Minimal RGB → (Hue 0-360, Saturation 0-100) ohne externe Libs."""
     r_, g_, b_ = r / 255.0, g / 255.0, b / 255.0
     cmax  = max(r_, g_, b_)
     cmin  = min(r_, g_, b_)
@@ -213,9 +215,11 @@ def _rgb_to_hs(r: int, g: int, b: int) -> tuple[float, float]:
     return round(h, 1), round(s, 1)
 
 
-# ── SpaClient ────────────────────────────────────────────────────────────────
+# ── SpaClient: TCP-Verbindung & Sende-Queue ──────────────────────────────────
 
 class SpaClient:
+    """Verwaltet die TCP-Verbindung zum Spa-Controller."""
+
     def __init__(self, host: str, port: int) -> None:
         self.host = host
         self.port = port
@@ -235,8 +239,12 @@ class SpaClient:
         self._assigned_channel: int | None = None
         self._channel_assigned = asyncio.Event()
 
+    # ── Verbindung ────────────────────────────────────────────────
+
     async def connect(self) -> None:
-        self._reader, self._writer = await asyncio.open_connection(self.host, self.port)
+        self._reader, self._writer = await asyncio.open_connection(
+            self.host, self.port
+        )
         import socket as _s
         sock = self._writer.transport.get_extra_info("socket")
         if sock:
@@ -247,7 +255,12 @@ class SpaClient:
         self._channel_assigned = asyncio.Event()
         self._recv_task = asyncio.create_task(self._receiver())
         await self._assign_channel()
-        _LOGGER.info("Spa verbunden: %s:%s (Kanal 0x%02X)", self.host, self.port, self._assigned_channel or 0)
+        _LOGGER.info(
+            "Spa verbunden: %s:%s (Kanal 0x%02X)",
+            self.host,
+            self.port,
+            self._assigned_channel or 0,
+        )
 
     async def disconnect(self) -> None:
         self._connected = False
@@ -264,6 +277,8 @@ class SpaClient:
                 await self._writer.wait_closed()
             except Exception:
                 pass
+
+    # ── Empfänger ─────────────────────────────────────────────────
 
     async def _read_msg(self) -> bytes | None:
         assert self._reader is not None
@@ -306,9 +321,20 @@ class SpaClient:
                 _LOGGER.info("Spa-Kanal zugewiesen: 0x%02X", assigned)
                 continue
 
+            if mtype == MSG_CHANNEL_REQ and len(msg) >= 7:
+                ch = msg[2]
+                if ch not in (CH_BROADCAST, 0xFF):
+                    self._assigned_channel = ch
+                    self._channel_assigned.set()
+                    _LOGGER.info("Spa-Kanal aus Antwort 0x01: 0x%02X", ch)
+                continue
+
+            if mtype == MSG_SET_TEMP:
+                _LOGGER.debug("C6-Antwort empfangen: %s", msg.hex())
+                continue
+
             if mtype == CLEAR_TO_SEND:
-                assigned = self._assigned_channel or CMD_CHANNEL
-                if channel == CMD_CHANNEL or channel == assigned:
+                if channel == CMD_CHANNEL:
                     self._cts_ch += 1
                     if not self._send_q.empty():
                         try:
@@ -333,20 +359,26 @@ class SpaClient:
                         self._lights = dec
                         self._lights_seq += 1
 
+    # ── Senden ────────────────────────────────────────────────────
+
     async def _write_direct(self, packet: bytes) -> None:
+        """Direkt senden (Channel-Request, NACK, C6 – ohne CTS-Queue)."""
         if not self._writer:
             raise UpdateFailed("Keine Verbindung zum Spa")
         self._writer.write(packet)
         await self._writer.drain()
 
     async def _assign_channel(self) -> None:
+        """Bus-Kanal vom Spa anfordern (erforderlich für C6-Temperatur)."""
         await asyncio.sleep(0.5)
         await self._write_direct(_build_channel_request())
         try:
-            await asyncio.wait_for(self._channel_assigned.wait(), timeout=8.0)
+            await asyncio.wait_for(self._channel_assigned.wait(), timeout=10.0)
         except asyncio.TimeoutError:
             self._assigned_channel = CMD_CHANNEL
-            _LOGGER.warning("Kein Channel-Assignment – Fallback auf 0x%02X", CMD_CHANNEL)
+            _LOGGER.warning(
+                "Kein Channel-Assignment – Fallback auf 0x%02X", CMD_CHANNEL
+            )
         ch = self._assigned_channel or CMD_CHANNEL
         self._assigned_channel = ch
         await self._write_direct(_build_nack(ch))
@@ -354,6 +386,8 @@ class SpaClient:
 
     async def send_button(self, btn: int) -> None:
         await self._send_q.put(_build_cc(btn))
+
+    # ── Warte-Helfer ──────────────────────────────────────────────
 
     async def wait_status(self, n: int = 6, timeout: float = 4.0) -> bool:
         start = self._status_seq
@@ -384,6 +418,8 @@ class SpaClient:
             elapsed += 0.2
         return False
 
+    # ── Datenzugriff ─────────────────────────────────────────────
+
     @property
     def status(self) -> dict | None:
         return self._status
@@ -400,6 +436,8 @@ class SpaClient:
     def assigned_channel(self) -> int | None:
         return self._assigned_channel
 
+    # ── Status-Helfer ─────────────────────────────────────────────
+
     async def _status_snapshot(self) -> dict | None:
         async with self._lock:
             return dict(self._status) if self._status else None
@@ -410,9 +448,11 @@ class SpaClient:
         await self._assign_channel()
         return self._assigned_channel or CMD_CHANNEL
 
+    # ── Temperatur setzen (C6 + Channel-Assignment) ───────────────
+
     async def set_temperature(self, target: float) -> None:
-        """Verbesserte Temperatursteuerung mit ausführlichem Logging"""
-        target = max(20.0, min(40.0, round(target * 2) / 2.0))
+        """Setzt Soll-Temperatur per C6-Befehl auf dem zugewiesenen Kanal."""
+        target = max(20.0, min(40.0, target))
         raw_target = int(round(target * 2))
 
         async with self._cmd_lock:
@@ -420,40 +460,52 @@ class SpaClient:
             snap = await self._status_snapshot()
             if not snap:
                 raise UpdateFailed("Kein Status vom Spa")
-
-            current = snap.get("set_temp")
-            _LOGGER.info("🔧 set_temperature() aufgerufen: aktuell=%.1f°C, Ziel=%.1f°C (raw=0x%02X)", 
-                        current, target, raw_target)
-
-            if abs(current - target) < 0.3:
-                _LOGGER.info("Temperatur bereits nah genug am Ziel")
+            if abs(snap["set_temp"] - target) < 0.3:
                 return
 
-            for attempt in range(4):
-                _LOGGER.debug("C6 Versuch %d: Sende Paket für %.1f°C", attempt+1, target)
-                pkt = _build_c6_temp(target, channel)
-                await self._send_q.put(pkt)
-                await self.wait_status(n=8, timeout=8.0)
+            _LOGGER.debug(
+                "C6 Soll-Temp %.1f °C (raw=%s) auf Kanal 0x%02X",
+                target,
+                raw_target,
+                channel,
+            )
 
-                deadline = time.monotonic() + 10.0
+            for attempt in range(3):
+                pkt = _build_c6_temp(target, channel)
+                await self._write_direct(pkt)
+                await self.wait_status(n=6, timeout=6.0)
+
+                deadline = time.monotonic() + 8.0
                 while time.monotonic() < deadline:
                     cur = await self._status_snapshot()
-                    if cur and abs(cur.get("set_temp", 0) - target) < 0.4:
-                        _LOGGER.info("✅ Temperatur erfolgreich auf %.1f°C gesetzt!", cur["set_temp"])
+                    if cur and (
+                        abs(cur["set_temp"] - target) < 0.3
+                        or cur["raw_d8"] == raw_target
+                    ):
+                        _LOGGER.info(
+                            "Soll-Temperatur auf %.1f °C gesetzt (Versuch %s)",
+                            cur["set_temp"],
+                            attempt + 1,
+                        )
                         return
-                    await asyncio.sleep(0.25)
+                    await asyncio.sleep(0.1)
 
-                _LOGGER.warning("C6 Versuch %d fehlgeschlagen", attempt + 1)
                 await self._write_direct(_build_nack(channel))
-                await asyncio.sleep(0.5)
+                await asyncio.sleep(0.3)
 
-            _LOGGER.error("❌ Alle C6-Versuche fehlgeschlagen. Temperatur bleibt bei 41°C")
-            raise UpdateFailed(f"Temperatur konnte nicht auf {target:.1f}°C gesetzt werden")
+            final = await self._status_snapshot()
+            got = final["set_temp"] if final else None
+            raise UpdateFailed(
+                f"Soll-Temperatur konnte nicht auf {target:.1f} °C gesetzt werden "
+                f"(aktuell: {got} °C)"
+            )
 
 
 # ── DataUpdateCoordinator ────────────────────────────────────────────────────
 
 class SpaCoordinator(DataUpdateCoordinator):
+    """Koordiniert Daten-Updates und hält den SpaClient am Leben."""
+
     def __init__(self, hass: HomeAssistant, client: SpaClient) -> None:
         super().__init__(
             hass,
